@@ -285,6 +285,14 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     std::atomic_thread_fence(std::memory_order_seq_cst);
     _mm_sfence();
     const OnDevice on_device(device_);
+    if (d_dt_done_ != nullptr) {   // sums mode: the done words are device memory - raised from a stream of their own
+        cudaStream_t rs = nullptr;
+        if (cudaStreamCreateWithFlags(&rs, cudaStreamNonBlocking) == cudaSuccess) {
+            cudaMemsetAsync(d_dt_done_, 0xff, 8 * 16 * sizeof(uint32_t), rs);
+            cudaStreamSynchronize(rs);
+            cudaStreamDestroy(rs);
+        }
+    }
     const Clock::time_point t0 = Clock::now();
     for (cudaStream_t s : {cs_, copy_}) {
         if (s == nullptr) continue;
@@ -415,6 +423,7 @@ Verifier::~Verifier() {
     if (arena_) cudaFree(arena_);
     if (ple_scratch_b_) cudaFree(ple_scratch_b_);
     if (tsum_) cudaFree(tsum_);
+    if (d_dt_done_) cudaFree(d_dt_done_);
     if (d_owner_) cudaFree(d_owner_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
                      h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_bal_, h_dt_done_};
@@ -437,6 +446,16 @@ bool Verifier::set_device_tiers(int n, std::function<bool(const DeviceTierWindow
         h_dt_done_ = (uint32_t*) h;
         for (int p = 0; p < 8; ++p) dt_done_ptr_[p] = (uint32_t*) d + p * 16;
     }
+    if (n > 0 && sums && d_dt_done_ == nullptr) {
+        if (cudaMalloc((void**) &d_dt_done_, 8 * 16 * sizeof(uint32_t)) != cudaSuccess ||
+            cudaMemset(d_dt_done_, 0, 8 * 16 * sizeof(uint32_t)) != cudaSuccess) {
+            cudaGetLastError();
+            err = "verify: device tiers: the done words (device)";
+            return false;
+        }
+    }
+    if (n > 0 && sums)
+        for (int p = 0; p < 8; ++p) dt_done_ptr_[p] = d_dt_done_ + p * 16;   // the window graph waits on these
     if (n > 0 && sums && tsum_ == nullptr) {
         const size_t ne = (size_t) g_->n_layers * (size_t) g_->n_expert;
         if (cudaMalloc((void**) &tsum_, (size_t) 8 * max_t_ * g_->n_embd * sizeof(float)) != cudaSuccess ||
@@ -464,10 +483,19 @@ bool Verifier::upload_tier_owner(const int32_t* owner, size_t n, std::string& er
 }
 
 bool Verifier::dt_launch(int T, int G, const int* gtb, const int* gte, std::string& err) {
-    for (int p = 0; p < dt_n_; ++p) *(volatile uint32_t*) (h_dt_done_ + p * 16) = 0;
-    std::atomic_thread_fence(std::memory_order_seq_cst);
     uint32_t* done[8] = {};
-    for (int p = 0; p < dt_n_; ++p) done[p] = h_dt_done_ + p * 16;   // host addresses: the tiers' (UVA, portable)
+    if (dt_sums_) {   // the device words: zeroed on this stream, ahead of the window graph that waits on them (the tiers
+                      // store into them only once the window's doorbell rings - after the zeroing)
+        if (cudaMemsetAsync(d_dt_done_, 0, 8 * 16 * sizeof(uint32_t), cs_) != cudaSuccess) {
+            err = "verify: device tiers: zeroing the done words";
+            return false;
+        }
+        for (int p = 0; p < dt_n_; ++p) done[p] = d_dt_done_ + p * 16;   // device addresses: the tiers store over P2P
+    } else {
+        for (int p = 0; p < dt_n_; ++p) *(volatile uint32_t*) (h_dt_done_ + p * 16) = 0;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        for (int p = 0; p < dt_n_; ++p) done[p] = h_dt_done_ + p * 16;   // host addresses: the tiers' (UVA, portable)
+    }
     DeviceTierWindow w{};
     w.seq = h_seq_;
     w.x = h_x_;

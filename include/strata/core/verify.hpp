@@ -535,6 +535,9 @@ private:
     int32_t* d_owner_ = nullptr;                                     ///< the tiers' ownership, [n_layers * n_expert]
     uint32_t* h_dt_done_ = nullptr;                                  ///< tier p's done word at [p * 16] (mapped, portable)
     uint32_t* dt_done_ptr_[8] = {};                                  ///< their device addresses
+    /// sums mode: the done words in THIS GPU's memory, stored by the tiers over P2P right after their sums - the same
+    /// path as the sums, so a done word never arrives before them (a mapped host word could: another route)
+    uint32_t* d_dt_done_ = nullptr;
     std::function<bool(const DeviceTierWindow&, std::string&)> dt_begin_;
     bool dt_launch(int T, int G, const int* gtb, const int* gte, std::string& err);
     int groups_[9] = {};
