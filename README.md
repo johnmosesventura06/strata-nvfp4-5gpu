@@ -1,13 +1,69 @@
-# Strata NVFP4 — four-GPU fleet edition
+# Strata NVFP4 — five-GPU fleet edition
 
-**Qwen3.8-Flash-Next (125B hybrid MoE) with NVFP4 experts, spread across four consumer GPUs instead of squeezed
+**Qwen3.8-Flash-Next (125B hybrid MoE) with NVFP4 experts, spread across five consumer GPUs instead of squeezed
 onto one.** A fork of [sergqwer/strata-nvfp4](https://github.com/sergqwer/strata-nvfp4) (itself a fork of
 [Niko1221/Strata](https://github.com/Niko1221/Strata)) that adds the multi-GPU work: expert tiers on the peer
 cards, the output head split across all of them, tier prefill, NVMe session journaling, and mixed-generation
 support. Measured on a 4× RTX 5060 Ti 16 GB rig and a mixed RTX 3090 + 3× 5060 Ti rig (9950X, 128 GB DDR5-5000,
 driver 615.71.09 with the consumer-P2P patch, CUDA 13.3, Linux).
 
-## What's new (October 2026): concurrency and the multi-tier prompt path
+## What's new (21 October 2026): the fifth GPU - every expert on a GPU, 4 slots, the RAM copy gone
+
+The production rig is now an **RTX 3090 trunk + 4× RTX 5060 Ti tiers** (each tier on a CPU-attached Gen5 x4 link;
+9950X, 128 GB DDR5-5000). The fourth tier made room for every expert of the model on a GPU, and the work below turns
+that into speed, concurrency and free RAM. Config of record: `configs/nvfp4-512k-np2-vision.json`.
+
+| | 3 tiers (20 Oct, before) | 4 tiers, this edition |
+|---|---|---|
+| experts on a GPU | 20,446 of 24,576 | **24,576 of 24,576** |
+| batch slots (concurrent conversations) | 3 | **4** |
+| RAM available with the engine up | 12.7 GB | **65.7 GB** |
+| a client decoding while another client's 16K prompt is read | 41.6 tok/s | **59.2 tok/s** |
+| 16K-token prompt, time to first token | 9.62 s | **8.83-8.93 s** |
+| 1K prompts, aggregate decode, 3 clients | 117.6 tok/s | **134.9 tok/s** |
+| decode, all streams busy (sum / each) | 3: 146.7 / 49 | 3: **150.3 / 50**; 4: **153.6 / 38** |
+| steady batch window, all slots decoding (both on 4 tiers) | 3 slots: ~183 tok/s | 4 slots: **~197 tok/s** |
+
+**1. Four tiers and the head split across them.** `--peer-devices 1,2,3,4`. The verifier kept only three parts of
+the split output head, so a fourth tier refused to boot ("the head parts do not reach the vocabulary's end"); the
+part arrays now size to `kMaxPeerTiers` (8). `--head-split 0.7515` was swept 0-0.90 on four tiers: flat.
+
+**2. The tiers run their share of a decode window themselves** (`STRATA_DEVICE_TIERS=2`). Each tier GPU gets one
+graph per window shape that waits on the trunk's doorbell, plans its own entries on the device (a copy of its
+residency table), computes them with the same grouped expert kernel, and sends **one weighted sum per token** into
+the trunk's VRAM over P2P (summed in the token's own entry order, so a batch row never depends on its neighbours),
+with its done word stored after the sums on the same path. The host pool no longer launches or waits for the tiers
+(7.2 -> 0.15 ms of host time a window). 3-stream decode +1.5-2%; `=1` keeps the rows path (bit-identical to the pool).
+
+**3. The lend shadow** (`STRATA_LEND_SHADOW=1`, with `--kv-resident 20480`). The prompt path borrows the trunk's last
+cache slots for its buffers; their experts then sat on no GPU - streamed from RAM by the prompt path and computed on
+the **CPU** by the decode windows beside the read. GPU 4 now keeps a copy of those slots: during a loan it claims
+their experts (the prompt path, the pool and the tier graphs all route them there), and the loan is given back
+from the copy over P2P. The smaller K/V window (the minimum, 20480 cells) gives the trunk ~228 more cache slots, so
+GPU 4 holds that many fewer experts and fits the whole copy; it cost nothing measurable up to 172K tokens of
+context. Decode beside a 16K read 53.7 -> 58.4 tok/s; the CPU experts in those windows 1.21 per layer-window -> 0.
+
+**4. The expert RAM copy goes** (`--ram-budget 4`, the low-RAM mode, on a 128 GB machine). With every expert on a
+GPU and the shadow, nothing reads the 63 GB RAM copy after boot - the serve path now counts it per request
+("expert RAM copy since the first request: 0 blob reads"). The low-RAM mode fills the GPUs from the pack file at
+boot and keeps 4 GB of experts in RAM: **0 MB of expert reads after boot**, the same outputs, the same speed.
+In this mode the tiers need `--peer-reserve-mib 1024`: at 768 their prompt buffers no longer fit and the prompt
+path falls back to the trunk alone (a 1K prompt's first token 0.88 -> 4.8 s; the boot log says so).
+
+**5. A fourth slot** (`"parallel": 4`). The freed RAM carries its pinned K/V copy (~7 GB); its session takes
+1.24 GB of the trunk's VRAM and ~500 experts move to GPU 4 - still 24,576 of 24,576 on the GPUs. With three
+streams busy it changes nothing (150.3 vs 152.4 tok/s); with four it serves the fourth conversation at once instead
+of queueing it (and evicting another conversation's slot to the journal every turn), at ~197 tok/s steady total.
+
+**Measured and not taken:** more MTP proposals per batch slot (2: -17%, 3: -28%; acceptance 63 / 35 / 20%, a row
+costs ~3 ms of trunk time); fixed placement without the adaptive tier (prompt reads +7.6% slower); moving the hot
+experts between trunk and tiers (`STRATA_PEER_HOT` 0-0.7: flat below 0.45); an asynchronous batch commit (drafts
+then accepted less: dropped); parallel slot drafts (exact, -0.5 ms a window, within noise; kept on a branch).
+**Open:** long-context decode is ~4% lower in the low-RAM mode (88K: 102-105 vs 107-111 tok/s), cause not yet known.
+**The ceiling now** is the trunk's own work per window row (~3.2 ms a row, ~8.8 ms fixed per window): a fourth
+stream shares the same total. Raising it needs the trunk's dense work split across GPUs.
+
+## Earlier (October 2026, RTX 3090 + 3× RTX 5060 Ti): concurrency and the multi-tier prompt path
 
 Measured on the production rig (RTX 3090 trunk + 3× RTX 5060 Ti tiers), same session, the build with items 1-2
 against the build with all six:
