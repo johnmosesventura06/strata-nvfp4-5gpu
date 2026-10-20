@@ -61,8 +61,7 @@ public:
 
     /// The device address of (layer, expert)'s blob on the peer, or null when it is not resident.
     const uint8_t* slot_ptr(int64_t layer, int64_t expert) {
-        const int32_t sl = res_[(size_t) (layer * n_expert_ + expert)];
-        return sl >= 0 ? cache_.device_slot(sl) : nullptr;
+        return ptr_of(res_[(size_t) (layer * n_expert_ + expert)]);
     }
     /// Whether the primary (device 0) and the peer can read each other's memory directly (NVLink / PCIe P2P).
     bool p2p() const { return p2p_; }
@@ -116,6 +115,21 @@ public:
     /// ownership (STRATA_DEVICE_TIERS=2) follows it.
     uint64_t res_version() const { return res_version_; }
 
+    // ---- STRATA_LEND_SHADOW: a copy of the main GPU's lendable cache slots, kept on this tier.  While the prompt path
+    // borrows those slots, the tier CLAIMS their experts (its residency points at the shadow slot), so the prompt path
+    // and the decode windows beside the read compute them here - and the main refills its slots from here (P2P).
+    // Shadow slot j holds whatever the caller copies into it; the residency entries a claim writes are
+    // >= the cache's slot count (the shadow's index base), and adapt() never picks one as a victim.
+    /// Allocates `slot_bytes.size()` shadow slots of those sizes (256-aligned), leaving `reserve_mib` free.  Before
+    /// device_open (the device path's slot table covers the shadow).
+    bool shadow_open(const std::vector<int64_t>& slot_bytes, int reserve_mib, std::string& err);
+    int64_t shadow_slots() const { return (int64_t) shadow_off_.size(); }
+    uint8_t* shadow_slot(int64_t j) const { return shadow_ + shadow_off_[(size_t) j]; }
+    /// Free VRAM on the tier now (for sizing a shadow).
+    uint64_t free_bytes() const;
+    void shadow_claim(int64_t layer, int64_t expert, int64_t j);
+    void shadow_release(int64_t layer, int64_t expert, int64_t j);
+
     int64_t resident() const { return resident_; }
     /// the last launch writes its rows into the host rows itself (the caller must not touch them)
     bool launched_direct() const { return launched_direct_; }
@@ -144,6 +158,14 @@ private:
     std::vector<int32_t> row_of_;                     ///< compact row -> original entry
     int64_t launched_rows_ = 0;
     bool launched_direct_ = false;
+    // STRATA_LEND_SHADOW
+    uint8_t* shadow_ = nullptr;
+    std::vector<uint64_t> shadow_off_;
+    const uint8_t* ptr_of(int32_t sl) {
+        if (sl < 0) return nullptr;
+        if (sl >= (int32_t) resident_) return sl - (int32_t) resident_ < (int32_t) shadow_off_.size() ? shadow_slot(sl - resident_) : nullptr;
+        return cache_.device_slot(sl);
+    }
     // STRATA_DEVICE_TIERS
     bool dev_ready_ = false;
     bool res_dev_dirty_ = true;                       ///< res_ changed since the last upload

@@ -55,6 +55,7 @@ PeerExperts::~PeerExperts() { close(); }
 void PeerExperts::close() {
     if (device_ < 0) return;
     device_close();
+    if (shadow_ != nullptr) { On on(device_); cudaFree(shadow_); shadow_ = nullptr; shadow_off_.clear(); }
     {
         On on(device_);
         if (stream_) cudaStreamSynchronize(stream_);
@@ -206,7 +207,7 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
         if (seen) continue;
         const int32_t slot = res_[(size_t) (layer * n_expert_ + ids[i])];
         if (slot < 0) { err = "peer experts: an entry was planned for the peer but is not resident"; return false; }
-        m.ptr[groups] = (unsigned long long) cache_.device_slot(slot);
+        m.ptr[groups] = (unsigned long long) ptr_of(slot);   // a cache slot, or a claimed shadow slot
         m.start[groups] = rows;
         for (int64_t j = i; j < n; ++j)
             if (kind[j] == 2 && ids[j] == ids[i]) {
@@ -287,7 +288,7 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
         const int32_t* r0 = res0 + l * n_expert_;
         const int32_t* r1 = res_.data() + l * n_expert_;
         for (int32_t e = 0; e < (int32_t) n_expert_; ++e) {
-            if (r1[e] >= 0) vict.emplace_back(u[e], e);
+            if (r1[e] >= 0 && r1[e] < (int32_t) resident_) vict.emplace_back(u[e], e);   // never a claimed shadow slot
             else if (r0[e] < 0 && u[e] >= 2.0f) cand.emplace_back(u[e], e);
         }
         if (cand.empty() || vict.empty()) continue;
@@ -383,12 +384,20 @@ bool PeerExperts::device_open(int max_t, int k, std::string& err) {
         ck(cudaMalloc(&dscratch_, strata::kernels::native_expert_scratch_bytes(capx, ff)), "device scratch", err) &&
         ck(cudaMalloc((void**) &d_counter_, sizeof(unsigned)), "device counter", err) &&
         ck(cudaMemset(d_counter_, 0, sizeof(unsigned)), "device counter", err) &&
-        (off == nullptr || ck(cudaMalloc((void**) &d_slot_off_, (size_t) resident_ * sizeof(unsigned long long)), "slot offsets", err)) &&
-        (off == nullptr || ck(cudaMemcpy(d_slot_off_, off, (size_t) resident_ * sizeof(unsigned long long), cudaMemcpyHostToDevice), "slot offsets", err)) &&
+        ck(cudaMalloc((void**) &d_slot_off_, (size_t) (resident_ + shadow_slots()) * sizeof(unsigned long long)), "slot offsets", err) &&
         ck(cudaMemcpy(d_res_, res_.data(), res_.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "residency", err);
     if (!ok) { device_close(); return false; }
     d_base_ = cache_.device_slot(0);   // slot 0 sits at offset 0 either way
-    d_blob_ = off == nullptr ? (long long) cache_.slot_offset(1) : 0;
+    d_blob_ = 0;
+    {   // every slot's offset from the arena base - the cache's, then the shadow's (a separate allocation: the
+        // difference wraps in 64 bits, and base + offset is the shadow slot's address again)
+        std::vector<unsigned long long> offs((size_t) (resident_ + shadow_slots()));
+        for (int64_t s = 0; s < resident_; ++s) offs[(size_t) s] = off != nullptr ? off[s] : cache_.slot_offset(s);
+        for (int64_t j = 0; j < shadow_slots(); ++j)
+            offs[(size_t) (resident_ + j)] = (unsigned long long) (uintptr_t) shadow_slot(j) - (unsigned long long) (uintptr_t) d_base_;
+        if (!ck(cudaMemcpy(d_slot_off_, offs.data(), offs.size() * sizeof(unsigned long long), cudaMemcpyHostToDevice),
+                "slot offsets", err)) { device_close(); return false; }
+    }
     res_dev_dirty_ = false;
     dev_ready_ = true;
     return true;
@@ -465,6 +474,48 @@ bool PeerExperts::device_launch(const DeviceWindow& w, std::string& err) {
         dgraphs_.push_back({w.T, w.G, w.lb, w.le, (const void*) w.seq, exec});
     }
     return ck(cudaGraphLaunch(exec, dstream_), "device window launch", err);
+}
+
+
+// ---- STRATA_LEND_SHADOW (see the header)
+
+uint64_t PeerExperts::free_bytes() const {
+    if (device_ < 0) return 0;
+    On on(device_);
+    size_t f = 0, t = 0;
+    return cudaMemGetInfo(&f, &t) == cudaSuccess ? (uint64_t) f : 0;
+}
+
+bool PeerExperts::shadow_open(const std::vector<int64_t>& slot_bytes, int reserve_mib, std::string& err) {
+    if (device_ < 0 || shadow_ != nullptr || dev_ready_) { err = "peer experts: shadow_open needs an open tier, once, before device_open"; return false; }
+    std::vector<uint64_t> off(slot_bytes.size());
+    uint64_t total = 0;
+    for (size_t j = 0; j < slot_bytes.size(); ++j) { off[j] = total; total += ((uint64_t) slot_bytes[j] + 255) / 256 * 256; }
+    const uint64_t reserve = (uint64_t) std::max(reserve_mib, 0) << 20;
+    if (total + reserve > free_bytes()) {
+        err = "peer experts: the shadow (" + std::to_string(total >> 20) + " MiB) does not fit beside the reserve";
+        return false;
+    }
+    On on(device_);
+    if (!ck(cudaMalloc((void**) &shadow_, total), "shadow", err)) { shadow_ = nullptr; return false; }
+    shadow_off_ = std::move(off);
+    return true;
+}
+
+void PeerExperts::shadow_claim(int64_t layer, int64_t expert, int64_t j) {
+    int32_t& r = res_[(size_t) (layer * n_expert_ + expert)];
+    if (r >= 0) return;   // the tier holds it already (never the case for a lent slot's expert)
+    r = (int32_t) (resident_ + j);
+    res_dev_dirty_ = true;
+    ++res_version_;
+}
+
+void PeerExperts::shadow_release(int64_t layer, int64_t expert, int64_t j) {
+    int32_t& r = res_[(size_t) (layer * n_expert_ + expert)];
+    if (r != (int32_t) (resident_ + j)) return;
+    r = kNotResident;
+    res_dev_dirty_ = true;
+    ++res_version_;
 }
 
 }  // namespace strata::core

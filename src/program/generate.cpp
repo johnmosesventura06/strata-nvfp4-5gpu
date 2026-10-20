@@ -7257,6 +7257,56 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
+        // STRATA_LEND_SHADOW=1 (opt-in): the tier GPU with the most free VRAM keeps a copy of CUDA0's lendable cache
+        // slots.  While the prompt path borrows them (lend), that tier claims their experts - the prompt path and the
+        // decode windows beside the read compute them there instead of streaming them from RAM (prompt) or on the CPU
+        // (windows) - and the loan is given back from the copy over P2P instead of from RAM (refill).  Shadow slot j
+        // mirrors CUDA0 slot lsh_lo + j; lsh_of[j] is the (layer * n_expert + expert) it holds (-1: stale).
+        int lsh_p = -1;
+        int32_t lsh_lo = -1;
+        std::vector<int32_t> lsh_of;
+        std::vector<std::pair<int32_t, int32_t>> lsh_claimed;   // (pair, shadow slot) claimed for the current loan
+        auto lsh_bytes = [&](int64_t s) -> int64_t {
+            const uint64_t* off = xcache.slot_offsets();
+            return off != nullptr ? (int64_t) (off[s + 1] - off[s]) : (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+        };
+        if (const char* ls = std::getenv("STRATA_LEND_SHADOW"); ls != nullptr && std::atoi(ls) != 0 && n_peers > 0 &&
+            n_stages == 1 && !pf_parts.empty() && pf_parts[0].first >= 0 && !o.vram_elastic) {
+            for (int p = 0; p < n_peers; ++p)
+                if (lsh_p < 0 || peers[p].free_bytes() > peers[lsh_p].free_bytes()) lsh_p = p;
+            const char* rv = std::getenv("STRATA_LEND_SHADOW_RESERVE_MIB");
+            const int reserve = rv != nullptr ? std::atoi(rv) : 256;
+            const uint64_t room = peers[lsh_p].free_bytes() > ((uint64_t) reserve << 20) ? peers[lsh_p].free_bytes() - ((uint64_t) reserve << 20) : 0;
+            const int64_t S = xcache.slots(), first = pf_parts[0].first;
+            int64_t lo = S;
+            uint64_t used = 0;
+            while (lo > first && used + ((uint64_t) lsh_bytes(lo - 1) + 255) / 256 * 256 <= room) used += ((uint64_t) lsh_bytes(--lo) + 255) / 256 * 256;
+            std::vector<int64_t> sizes;
+            for (int64_t s = lo; s < S; ++s) sizes.push_back(lsh_bytes(s));
+            if (sizes.empty() || !peers[lsh_p].shadow_open(sizes, reserve, err)) {
+                std::fprintf(stderr, "strata serve: STRATA_LEND_SHADOW is off: %s\n", sizes.empty() ? "no room on any tier" : err.c_str());
+                lsh_p = -1;
+            } else {
+                lsh_lo = (int32_t) lo;
+                lsh_of.assign((size_t) (S - lo), -1);
+                const int dsh = peers[lsh_p].device();
+                const auto t_sh = Clock::now();
+                for (int64_t s = lo; s < S; ++s)
+                    if (cudaMemcpyPeer(peers[lsh_p].shadow_slot(s - lo), dsh, xcache.device_slot((int32_t) s), 0,
+                                       (size_t) lsh_bytes(s)) != cudaSuccess) {
+                        std::fprintf(stderr, "strata serve: STRATA_LEND_SHADOW: the copy failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+                        return 1;
+                    }
+                for (size_t i = 0; i < host_res.size(); ++i)
+                    if (host_res[i] >= lsh_lo) lsh_of[(size_t) (host_res[i] - lsh_lo)] = (int32_t) i;
+                std::fprintf(stderr, "strata serve: STRATA_LEND_SHADOW: GPU %d keeps a copy of CUDA0's slots %lld-%lld "
+                                     "(%.2f GiB, copied in %.0f ms): %lld of the %lld lendable slots%s\n",
+                             dsh, (long long) lo, (long long) (S - 1), (double) used / 1073741824.0,
+                             std::chrono::duration<double, std::milli>(Clock::now() - t_sh).count(), (long long) (S - lo),
+                             (long long) (S - first),
+                             lo > first ? " - WARNING: the rest of a full loan streams from RAM / runs on the CPU" : " (all)");
+            }
+        }
         // STRATA_DEVICE_TIERS=1 (opt-in): the tiers serve the serial windows' tier experts from graphs of their own that
         // wait on the doorbell (PeerExperts::device_launch) - no launch and no spin of the host pool per layer
         if (const char* dt = std::getenv("STRATA_DEVICE_TIERS"); dt != nullptr && std::atoi(dt) != 0 && n_peers > 0) {
@@ -8161,6 +8211,12 @@ int main(int argc, char** argv) {
             src.commit_exchanges();   // the resident RAM mode: the evicted experts take their places in RAM
             for (const auto& [i, slot] : pending) {
                 host_res[(size_t) i] = slot;
+                if (lsh_p >= 0 && slot >= lsh_lo) {   // STRATA_LEND_SHADOW: the copy follows the slot
+                    const size_t j = (size_t) (slot - lsh_lo);
+                    lsh_of[j] = cudaMemcpyPeer(peers[lsh_p].shadow_slot((int64_t) j), peers[lsh_p].device(),
+                                               xcache.device_slot(slot), 0, (size_t) lsh_bytes(slot)) == cudaSuccess
+                                    ? (int32_t) i : -1;
+                }
                 srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);   // in VRAM now: RAM not needed
                 if (!drive.d.in_flight.empty()) drive.d.in_flight[(size_t) i] = 0;
             }
@@ -10680,8 +10736,18 @@ int main(int argc, char** argv) {
                 tr("refill start", (long long) p.lent.size());
                 const strata::core::OnDevice on(p.dev);
                 for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
-                    const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
                     const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                    if (lsh_p >= 0 && p.dev < 0 && slot >= lsh_lo && lsh_of[(size_t) (slot - lsh_lo)] == i) {
+                        // STRATA_LEND_SHADOW: from the tier's copy over P2P, on the queue sync_queued waits for
+                        if (cudaMemcpyPeerAsync(p.cache->device_slot(slot), 0, peers[lsh_p].shadow_slot(slot - lsh_lo),
+                                                peers[lsh_p].device(), (size_t) nb, 0) != cudaSuccess) {
+                            e = std::string("the shadow refill: ") + cudaGetErrorString(cudaGetLastError());
+                            return false;
+                        }
+                        host_res[(size_t) i] = slot;
+                        continue;
+                    }
+                    const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
                     if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
                                                             : p.cache->fill_slot_queued(slot, b, e, nb)))
                         return false;
@@ -10692,6 +10758,10 @@ int main(int argc, char** argv) {
             auto refill_wait = [&](PfPart& p, std::string& e) -> bool {
                 const strata::core::OnDevice on(p.dev);
                 if (!p.cache->sync_queued(e)) return false;
+                if (p.dev < 0 && lsh_p >= 0) {   // STRATA_LEND_SHADOW: CUDA0 holds them again - the tier lets go
+                    for (const auto& [i, j] : lsh_claimed) peers[lsh_p].shadow_release(i / g.n_expert, i % g.n_expert, j);
+                    lsh_claimed.clear();
+                }
 #if defined(_WIN32)
                 // The copies have landed: the file pages touched by the loan need not stay in the working set.
                 for (const auto& [i, slot] : p.lent)
@@ -10774,6 +10844,25 @@ int main(int argc, char** argv) {
                             }
                         }
                     p.lent_chunk = want;
+                    if (p.dev < 0 && lsh_p >= 0) {   // STRATA_LEND_SHADOW: the tier claims the lent experts it has a copy of
+                        int64_t miss = 0;
+                        for (const auto& [i, slot] : p.lent) {
+                            if (slot >= lsh_lo && lsh_of[(size_t) (slot - lsh_lo)] == i) {
+                                bool have = false;
+                                for (const auto& c : lsh_claimed) if (c.first == i) { have = true; break; }
+                                if (!have) {
+                                    peers[lsh_p].shadow_claim(i / g.n_expert, i % g.n_expert, slot - lsh_lo);
+                                    lsh_claimed.emplace_back(i, slot - lsh_lo);
+                                }
+                            } else ++miss;
+                        }
+                        if (miss > 0) {
+                            static int64_t warned = 0;
+                            if (warned++ < 5)
+                                std::fprintf(stderr, "strata serve: STRATA_LEND_SHADOW: WARNING: %lld lent slots have no "
+                                                     "copy on the tier (they stream from RAM / run on the CPU)\n", (long long) miss);
+                        }
+                    }
                 }
                 if (any) res_upload();
                 if (trace) {
