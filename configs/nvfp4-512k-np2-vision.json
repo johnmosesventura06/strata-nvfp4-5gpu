@@ -25,7 +25,7 @@
   "--expert-cache",
   "auto",
   "--peer-devices",
-  "1,2,3",
+  "1,2,3,4",
   "--peer-reserve-mib",
   "768",
   "--max-context",
