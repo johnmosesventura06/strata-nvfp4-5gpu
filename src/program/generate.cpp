@@ -7245,8 +7245,8 @@ int main(int argc, char** argv) {
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         {   // head split: this verifier's windows hand their mixed rows to the parts (set before init - the
             // tiling is validated there).  The layer-split/pipeline verifiers stay unsplit by design (v1).
-            strata::core::SplitHead* shp[3] = {};
-            for (size_t i = 0; i < split_heads.size() && i < 3; ++i) shp[i] = split_heads[i].get();
+            strata::core::SplitHead* shp[strata::core::kMaxPeerTiers] = {};
+            for (size_t i = 0; i < split_heads.size() && i < (size_t) strata::core::kMaxPeerTiers; ++i) shp[i] = split_heads[i].get();
             ver.set_split_heads(shp, (int) split_heads.size());
         }
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
@@ -12654,8 +12654,8 @@ int main(int argc, char** argv) {
         vh.n_slots = xcache.slots();
         if (pcie_balance()) ver.set_pcie_balance(&drive.d.pcie_model);
         {   // head split (the one-shot generate path's verifier)
-            strata::core::SplitHead* shp[3] = {};
-            for (size_t i = 0; i < split_heads.size() && i < 3; ++i) shp[i] = split_heads[i].get();
+            strata::core::SplitHead* shp[strata::core::kMaxPeerTiers] = {};
+            for (size_t i = 0; i < split_heads.size() && i < (size_t) strata::core::kMaxPeerTiers; ++i) shp[i] = split_heads[i].get();
             ver.set_split_heads(shp, (int) split_heads.size());
         }
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {

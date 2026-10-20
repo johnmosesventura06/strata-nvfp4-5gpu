@@ -138,8 +138,8 @@ public:
     /// buffers bind; the window builder reads it.  Needs the native head (its mixed rows are the handoff).
     void set_split_heads(SplitHead* const* arr, int n) {
         n_shead_ = 0;
-        for (int i = 0; i < 3; ++i) sheads_[i] = nullptr;
-        for (int i = 0; i < n && i < 3; ++i)
+        for (int i = 0; i < kMaxPeerTiers; ++i) sheads_[i] = nullptr;
+        for (int i = 0; i < n && i < kMaxPeerTiers; ++i)
             if (arr[i] != nullptr && arr[i]->on()) sheads_[n_shead_++] = arr[i];
     }
     int split_heads() const { return n_shead_; }
@@ -530,7 +530,7 @@ private:
     // head split (set_split_heads): the parts, the main's row count (0 = not bound yet; n_vocab_ unsplit, the
     // first part's split() with parts), the assembled full-vocab rows for the samplers, the mapped winning
     // logits of the main's part (argmax_rows' out_val), and the handoff/done protocol counters.
-    SplitHead* sheads_[3] = {};
+    SplitHead* sheads_[kMaxPeerTiers] = {};   // one head part per tier GPU (--peer-devices)
     int n_shead_ = 0;
     int64_t head_rows_ = 0;
     float* head_full_ = nullptr;
