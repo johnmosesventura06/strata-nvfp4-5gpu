@@ -278,6 +278,10 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     // wait_flag_ge_or also returns on its flag.)  A host function raising flag B later only raises.
     for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_})
         if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
+    if (dt_n_ > 0) {   // STRATA_DEVICE_TIERS: the tiers' graphs spin on the doorbell, the window graph on their words
+        if (h_seq_ != nullptr) *(volatile uint32_t*) h_seq_ = UINT32_MAX;
+        for (int p = 0; p < dt_n_; ++p) *(volatile uint32_t*) (h_dt_done_ + p * 16) = UINT32_MAX;
+    }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     _mm_sfence();
     const OnDevice on_device(device_);
@@ -411,9 +415,53 @@ Verifier::~Verifier() {
     if (arena_) cudaFree(arena_);
     if (ple_scratch_b_) cudaFree(ple_scratch_b_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_bal_};
+                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_bal_, h_dt_done_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
+}
+
+bool Verifier::set_device_tiers(int n, std::function<bool(const DeviceTierWindow&, std::string&)> begin,
+                                std::string& err) {
+    if (n < 0 || n > 8) { err = "verify: device tiers: 0 to 8 tiers"; return false; }
+    if (n > 0 && (device_plan_ || remote_opt_ != nullptr)) {
+        err = "verify: device tiers: not with STRATA_VERIFY_DEVICE_PLAN or --remote-expert-opt";
+        return false;
+    }
+    const OnDevice on_device(device_);
+    if (n > 0 && h_dt_done_ == nullptr) {
+        void* h = nullptr;
+        void* d = nullptr;
+        if (!mapped(8 * 16 * sizeof(uint32_t), &h, &d)) { err = "verify: device tiers: the done words"; return false; }
+        h_dt_done_ = (uint32_t*) h;
+        for (int p = 0; p < 8; ++p) dt_done_ptr_[p] = (uint32_t*) d + p * 16;
+    }
+    dt_n_ = n;
+    dt_begin_ = std::move(begin);
+    return true;
+}
+
+bool Verifier::dt_launch(int T, int G, const int* gtb, const int* gte, std::string& err) {
+    for (int p = 0; p < dt_n_; ++p) *(volatile uint32_t*) (h_dt_done_ + p * 16) = 0;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    uint32_t* done[8] = {};
+    for (int p = 0; p < dt_n_; ++p) done[p] = h_dt_done_ + p * 16;   // host addresses: the tiers' (UVA, portable)
+    DeviceTierWindow w{};
+    w.seq = h_seq_;
+    w.x = h_x_;
+    w.ids = h_ids_;
+    w.rows = h_ymiss_;
+    w.done = done;
+    w.lb = lb_;
+    w.le = le_;
+    w.G = G;
+    for (int i = 0; i < 2; ++i) { w.gtb[i] = gtb[i]; w.gte[i] = gte[i]; }
+    w.k = (int) ss_->k;
+    w.T = T;
+    if (!dt_begin_ || !dt_begin_(w, err)) {
+        if (err.empty()) err = "verify: device tiers: no launch hook";
+        return false;
+    }
+    return true;
 }
 
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
@@ -1609,6 +1657,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     wait_flag_ge_stamped(m_flag_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 2, nullptr, cs);
                 else
                     wait_flag_ge(m_flag_, ring, cs);           // the CPU's share is in the mapped rows
+                for (int p = 0; p < dt_n_; ++p)                // STRATA_DEVICE_TIERS: and each tier's
+                    wait_flag_ge(dt_done_ptr_[p], ring, cs);
                 stamp(l, 23, grp);
                 if (remote_opt_)   // #578: the helper's rows come back reduced; skip them as well
                     remote_opt_->copy_rows(parts_out, m_ymiss_ + (size_t) tb * K * N, tb, n, p_dst, p_counts + 1, cs);
@@ -2091,6 +2141,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     VDBG("staged; launching\n");
     if (h_bal_ != nullptr) std::memset(h_bal_, 0, (size_t) bal_p_.size() * 4 * 8);   // this window's stamps only
     if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
+    if (dt_n_ > 0 && !ar_on()) {   // STRATA_DEVICE_TIERS: the tiers' graphs first (they wait on the doorbell)
+        const int Gd = groups_[T] > 0 ? groups_[T] : 1;
+        const int dtb[2] = {0, (T + 1) / 2}, dte[2] = {Gd == 2 ? (T + 1) / 2 : T, T};
+        if (!dt_launch(T, Gd, dtb, dte, err)) return false;
+    }
     const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
     split_submitted_ = false;   // head split: this window's parts have not been submitted yet
     // gpu protocol: pre-launch the parts now - their graphs wait-value on the main's in-graph bump, so they
@@ -2852,6 +2907,10 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
     if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
     split_submitted_ = false;   // head split: this window's parts have not been submitted yet
+    if (dt_n_ > 0 && !ar_on()) {   // STRATA_DEVICE_TIERS: the tiers' graphs first (they wait on the doorbell)
+        const int dtb[2] = {0, S}, dte[2] = {S, S};
+        if (!dt_launch(S, 1, dtb, dte, err)) return false;
+    }
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, 0)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
@@ -3159,6 +3218,7 @@ bool Verifier::split_merge(int T, std::string& err) {
 bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
     const OnDevice on_device(device_);
     if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
+    if (dt_n_ > 0) { err = "verify: STRATA_DEVICE_TIERS serves the serial windows only (not --batch-groups)"; return false; }
     int rows[8] = {};
     for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
@@ -3348,6 +3408,7 @@ bool Verifier::prestage(int T, const int32_t* tokens, int64_t pos0, const int32_
 bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
     const OnDevice on_device(device_);
     if (fl_active_) { err = "verify: a window is already in flight on this verifier"; return false; }
+    if (dt_n_ > 0) { err = "verify: STRATA_DEVICE_TIERS serves the serial windows only (not --pipeline-windows)"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     SessionState& ss = *ss_;

@@ -7257,6 +7257,36 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
+        // STRATA_DEVICE_TIERS=1 (opt-in): the tiers serve the serial windows' tier experts from graphs of their own that
+        // wait on the doorbell (PeerExperts::device_launch) - no launch and no spin of the host pool per layer
+        if (const char* dt = std::getenv("STRATA_DEVICE_TIERS"); dt != nullptr && std::atoi(dt) != 0 && n_peers > 0) {
+            const char* why = n_stages > 1 ? "a layer split" : pipe ? "--pipeline-windows" : nullptr;
+            if (why != nullptr) {
+                std::fprintf(stderr, "strata serve: WARNING: STRATA_DEVICE_TIERS is off: not with %s\n", why);
+            } else {
+                const int dt_max_t = batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch);
+                bool dt_ok = true;
+                for (int p = 0; p < n_peers && dt_ok; ++p) dt_ok = peers[p].device_open(dt_max_t, (int) ss.k, err);
+                dt_ok = dt_ok && ver.set_device_tiers(n_peers, [&peers, n_peers](const strata::core::Verifier::DeviceTierWindow& w,
+                                                                                  std::string& e) {
+                    for (int p = 0; p < n_peers; ++p) {
+                        strata::core::PeerExperts::DeviceWindow dw;
+                        dw.seq = w.seq; dw.x = w.x; dw.ids = w.ids; dw.rows = w.rows; dw.done = w.done[p];
+                        dw.lb = w.lb; dw.le = w.le; dw.G = w.G; dw.k = w.k; dw.T = w.T;
+                        for (int i = 0; i < 2; ++i) { dw.gtb[i] = w.gtb[i]; dw.gte[i] = w.gte[i]; }
+                        if (!peers[p].device_launch(dw, e)) return false;
+                    }
+                    return true;
+                }, err);
+                if (!dt_ok) {
+                    std::fprintf(stderr, "strata serve: STRATA_DEVICE_TIERS: %s%s\n", err.c_str(), vram_free_note().c_str());
+                    return 1;
+                }
+                drive.d.peers_device = true;
+                std::fprintf(stderr, "strata serve: STRATA_DEVICE_TIERS: the %d tier GPUs serve the decode windows from graphs "
+                                     "of their own (they wait on the doorbell; the pool no longer launches them)\n", n_peers);
+            }
+        }
         auto free_slot_mtp_rows = [](float* p) { if (p != nullptr) (void) cudaFree(p); };
         std::vector<std::unique_ptr<float, decltype(free_slot_mtp_rows)>> slot_mtp_rows;
         if (batch_mtp) {

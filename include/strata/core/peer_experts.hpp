@@ -81,6 +81,32 @@ public:
     bool adapt(const float* usage, const int32_t* res0, int max_swaps, std::string& err);
     void apply_pending(bool wait);
 
+    // ---- STRATA_DEVICE_TIERS=1: the tier serves its share of a decode window from a graph of its own that waits on
+    // the main GPU's doorbell (the counter the host pool spins on), instead of the pool launching it layer by layer
+    // and spinning on it.  Per step (layer, group): wait for the doorbell, copy the published activations, plan the
+    // tier's entries from a device copy of the residency table (tier_plan: the pool's order), quantize, the same
+    // grouped expert kernel as launch(), scatter the rows into the same mapped rows, store the step number into a
+    // done word the main's window graph waits on.  Bitwise launch()'s rows.
+    struct DeviceWindow {
+        const uint32_t* seq = nullptr;   ///< the doorbell counter (mapped): step k has rung once it reads >= k + 1
+        const float* x = nullptr;        ///< the published activations (mapped), [rows][n_embd]
+        const int32_t* ids = nullptr;    ///< the published ids (mapped), [rows][k]
+        float* rows = nullptr;           ///< the result rows (mapped), [rows * k][n_embd]
+        uint32_t* done = nullptr;        ///< this tier's done word (mapped): = k + 1 once step k's rows are written
+        int64_t lb = 0, le = 0;          ///< the window's layers
+        int G = 1;                       ///< groups; step k = layer lb + k / G, group k % G
+        int gtb[2] = {0, 0}, gte[2] = {0, 0};
+        int k = 0;                       ///< routed experts a token
+        int T = 0;                       ///< the window's rows (the graph key with G and the addresses)
+    };
+    /// After open(): the device copies (residency table, slot offsets) and the buffers for windows of up to
+    /// `max_t` rows.  `max_t * k` <= 128.
+    bool device_open(int max_t, int k, std::string& err);
+    bool device_on() const { return dev_ready_; }
+    /// The window's graph on the tier's own stream (captured on its first use), after uploading the residency table
+    /// if it changed since the last window.  Call right after the main's window graph is launched.
+    bool device_launch(const DeviceWindow& w, std::string& err);
+
     int64_t resident() const { return resident_; }
     /// the last launch writes its rows into the host rows itself (the caller must not touch them)
     bool launched_direct() const { return launched_direct_; }
@@ -109,6 +135,23 @@ private:
     std::vector<int32_t> row_of_;                     ///< compact row -> original entry
     int64_t launched_rows_ = 0;
     bool launched_direct_ = false;
+    // STRATA_DEVICE_TIERS
+    bool dev_ready_ = false;
+    bool res_dev_dirty_ = true;                       ///< res_ changed since the last upload
+    int dev_max_t_ = 0, dev_k_ = 0;
+    long long dev_capx_ = 0;
+    cudaStream_t dstream_ = nullptr;
+    int32_t* d_res_ = nullptr;                        ///< res_ on the tier
+    unsigned long long* d_slot_off_ = nullptr;        ///< the arena's slot offsets (null: uniform slots)
+    const uint8_t* d_base_ = nullptr;
+    long long d_blob_ = 0;
+    int32_t* d_plan_ = nullptr;
+    float* dx_ = nullptr;   float* dout_ = nullptr;   // the device path's own buffers
+    uint8_t* dq8_ = nullptr;
+    void* dscratch_ = nullptr;
+    struct DevGraph { int T, G; int64_t lb, le; const void* seq; cudaGraphExec_t exec; };
+    std::vector<DevGraph> dgraphs_;
+    void device_close();
 };
 
 }  // namespace strata::core

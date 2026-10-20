@@ -292,6 +292,25 @@ public:
     /// residency table catches up with the host's (the adaptive tier's evictions, STRATA_ADAPT_FETCH's admissions).
     /// It gets this verifier's stream; false (with the message in `err`) fails the launch.
     void set_pre_launch(std::function<bool(cudaStream_t cs, std::string& err)> f) { pre_launch_ = std::move(f); }
+    /// STRATA_DEVICE_TIERS=1: `n` tier GPUs serve the tier experts of every window from graphs of their own
+    /// (PeerExperts::device_launch) that wait on this verifier's doorbell and write their rows into its mapped rows.
+    /// The window graph then waits on each tier's done word (mapped, portable) before it copies the rows, and `begin`
+    /// runs right after each window's graph is launched (it launches the tiers').  Before the first capture; the
+    /// serial windows only (run, run_slot_rows: the batch groups and the pipelined windows refuse it).
+    struct DeviceTierWindow {
+        const uint32_t* seq;             ///< the doorbell counter (mapped)
+        const float* x;                  ///< the published activations (mapped)
+        const int32_t* ids;              ///< the published ids (mapped)
+        float* rows;                     ///< the result rows (mapped)
+        uint32_t* const* done;           ///< done word of tier p (mapped, portable)
+        int64_t lb, le;
+        int G;
+        int gtb[2], gte[2];
+        int k;
+        int T;
+    };
+    bool set_device_tiers(int n, std::function<bool(const DeviceTierWindow&, std::string&)> begin, std::string& err);
+    int device_tiers() const { return dt_n_; }
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
 
     /// The PCIe count of each layer from measured costs (PcieModel) instead of a fixed share: the spin kernels stamp
@@ -499,6 +518,12 @@ private:
     void set_plan_slot(int grp);
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
     std::function<bool(cudaStream_t, std::string&)> pre_launch_;   // set_pre_launch
+    // STRATA_DEVICE_TIERS (set_device_tiers)
+    int dt_n_ = 0;
+    uint32_t* h_dt_done_ = nullptr;                                  ///< tier p's done word at [p * 16] (mapped, portable)
+    uint32_t* dt_done_ptr_[8] = {};                                  ///< their device addresses
+    std::function<bool(const DeviceTierWindow&, std::string&)> dt_begin_;
+    bool dt_launch(int T, int G, const int* gtb, const int* gte, std::string& err);
     int groups_[9] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
 

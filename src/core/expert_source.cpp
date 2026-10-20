@@ -3455,7 +3455,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (d.n_peers > 0)
         for (int64_t i = 0; i < n; ++i)
             peer_ix[i] = kind[i] == 2 ? (int8_t) d.peer_of(d.layers, (int32_t) ids[i]) : (int8_t) -1;
-    if (d.n_peers > 0) {                   // multi-GPU: start the tiers' shares before the CPU's own work
+    if (d.n_peers > 0 && !d.peers_device) {   // multi-GPU: start the tiers' shares before the CPU's own work
         std::string perr;
         int32_t kind_p[kMaxWindowEntries];
         for (int p = 0; p < d.n_peers; ++p) {
@@ -3536,7 +3536,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 if (kind[i] == 2 && d.n_peers > 0) ++d.peer_entries;
                 // multi-GPU: a direct tier launch is writing this row right now - zeroing it would race it;
                 // dec_batch: copy_rows_from_mapped_kernel already zeroes kind 0/1 rows on the GPU
-                if (!((kind[i] == 2 && d.n_peers > 0 && peer_ix[i] >= 0 && d.peers[peer_ix[i]]->launched_direct()) ||
+                // STRATA_DEVICE_TIERS: the tiers' own graphs write their rows (peers_device, set for the window)
+                if (!((kind[i] == 2 && d.n_peers > 0 && (d.peers_device ||
+                                                        (peer_ix[i] >= 0 && d.peers[peer_ix[i]]->launched_direct()))) ||
                       (gpu_zeroes_hits && (kind[i] == 0 || kind[i] == 1))))
                     std::memset(row, 0, (size_t) H * sizeof(float));
                 continue;
@@ -3579,7 +3581,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
             }
     }
-    if (d.n_peers > 0) {                   // multi-GPU: the tiers' rows, into the same mapped rows
+    if (d.n_peers > 0 && !d.peers_device) {   // multi-GPU: the tiers' rows, into the same mapped rows
         std::string perr;
         for (int p = 0; p < d.n_peers; ++p)
             if (!d.peers[p]->finish(out, perr)) {

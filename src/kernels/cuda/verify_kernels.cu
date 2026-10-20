@@ -1448,4 +1448,95 @@ bool pdl_launch_ok(const void* kernel, cudaStream_t stream) {
 }
 #endif
 
+// ---- STRATA_DEVICE_TIERS (see verify_kernels.hpp)
+namespace {
+// resident_plan_par_kernel's plan over the entries the tier holds: entry i is the tier's when res[ids[i]] >= 0; the
+// groups are its distinct experts in order of first occurrence, a group's entries its occurrences in increasing i
+__global__ void tier_plan_kernel(const int32_t* ids, int n, int k, const int32_t* __restrict__ res, int n_expert,
+                                 const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
+                                 int32_t* __restrict__ pl, long long capx) {
+    __shared__ int32_t s_id[128];
+    __shared__ int s_first[128], s_size[128];
+    const int i = threadIdx.x;
+    int32_t e = -1;
+    bool own = false;
+    if (i < n) {
+        e = ((const volatile int32_t*) ids)[i];
+        own = e >= 0 && e < n_expert && res[e] >= 0;
+        s_id[i] = own ? e : -1;
+    }
+    __syncthreads();
+    int first = i, rank = 0, size = 0;
+    if (own)
+        for (int j = 0; j < n; ++j) {
+            const bool same = s_id[j] == e;
+            if (same && j < first) first = j;
+            if (same && j < i) ++rank;
+            size += same;
+        }
+    if (i < n) { s_first[i] = own ? first : -1; s_size[i] = own ? size : 0; }
+    __syncthreads();
+    int32_t* counts = pl;
+    int32_t* start = pl + 4;
+    int32_t* dst = start + capx + 1;
+    int32_t* tok = dst + capx;
+    const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+    unsigned long long* ptr = (unsigned long long*) (pl + ptr_off);
+    int32_t* start2 = pl + ptr_off + 4 * capx;
+    if (own) {
+        int group = 0, gstart = 0;
+        for (int j = 0; j < first; ++j)
+            if (s_first[j] == j) { ++group; gstart += s_size[j]; }
+        if (i == first) {
+            const int32_t slot = res[e];
+            ptr[group] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
+            start[group] = gstart;
+        }
+        dst[gstart + rank] = i;
+        tok[gstart + rank] = i / k;
+    }
+    if (i == 0) {
+        int groups = 0, total = 0;
+        for (int j = 0; j < n; ++j)
+            if (s_first[j] == j) { ++groups; total += s_size[j]; }
+        start[groups] = total;
+        start2[0] = total;
+        counts[0] = groups;
+        counts[1] = total;
+        counts[2] = 0;
+    }
+}
+__global__ void scatter_rows_counted_kernel(const float4* __restrict__ src, float4* out, const int32_t* __restrict__ dst,
+                                            const int32_t* __restrict__ count, int64_t w4) {
+    const int r = (int) blockIdx.x;
+    if (r >= *count) return;
+    const int64_t row = dst[r];
+    for (int64_t j = threadIdx.x; j < w4; j += blockDim.x) out[row * w4 + j] = src[row * w4 + j];
+}
+__global__ void mapped_store_kernel(uint32_t* flag, uint32_t value) {
+    __threadfence_system();
+    *(volatile uint32_t*) flag = value;
+    __threadfence_system();
+}
+}  // namespace
+
+void tier_plan(const int32_t* ids, int n, int k, const int32_t* res_layer, int n_expert, const uint8_t* cache_base,
+               const unsigned long long* slot_off, long long blob, int32_t* plan, long long capx, void* stream) {
+    if (n > 128) { std::fprintf(stderr, "tier_plan: %d entries (at most 128)\n", n); std::exit(1); }
+    tier_plan_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ids, n, k, res_layer, n_expert, cache_base, slot_off, blob,
+                                                           plan, capx);
+    check("tier_plan");
+}
+void scatter_rows_counted(const float* src, float* out, const int32_t* dst, const int32_t* count, int cap,
+                          int64_t width, void* stream) {
+    if (cap <= 0) return;
+    scatter_rows_counted_kernel<<<cap, 256, 0, (cudaStream_t) stream>>>((const float4*) src, (float4*) out, dst, count,
+                                                                        width / 4);
+    check("scatter_rows_counted");
+}
+void mapped_store(uint32_t* flag, uint32_t value, void* stream) {
+    mapped_store_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
+    check("mapped_store");
+}
+
 }  // namespace strata::kernels

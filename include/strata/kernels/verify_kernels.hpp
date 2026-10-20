@@ -126,6 +126,21 @@ void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t*
 /// *flag += 1 once the stream's earlier work is visible to the host (mapped memory).  Graph-capturable.
 /// (head-split: the window graph's handoff/done counters.)
 void mapped_bump(uint32_t* flag, void* stream);
+
+// ---- STRATA_DEVICE_TIERS: a tier GPU serves its share of a decode window without the host (peer_experts.cpp)
+/// A tier's plan for one layer-group: of the n entries' expert ids (`ids`, read through volatile: mapped host memory
+/// the main GPU's doorbell wrote), the ones whose expert the tier holds (res[e] >= 0) - the distinct experts in
+/// routing order, each one's entries ascending (the host pool's order).  Layout as resident_plan's (counts | start |
+/// dst | tok | pad | ptr | ptr2 | start2, `capx` entries); counts[0] groups, counts[1] entries, counts[2] 0.  n <= 128.
+void tier_plan(const int32_t* ids, int n, int k, const int32_t* res_layer, int n_expert, const uint8_t* cache_base,
+               const unsigned long long* slot_off, long long blob, int32_t* plan, long long capx, void* stream);
+/// out[dst[r]] = src[dst[r]] (`width` floats a row, a multiple of 4) for r < *count (device memory), launched for
+/// `cap` rows: the tier's computed rows into the main's mapped rows, the count known only on the device.
+void scatter_rows_counted(const float* src, float* out, const int32_t* dst, const int32_t* count, int cap,
+                          int64_t width, void* stream);
+/// *flag = value once the stream's earlier work is visible system-wide (a store, not an increment: the reader
+/// waits for its ring number with wait_flag_ge).  Graph-capturable.
+void mapped_store(uint32_t* flag, uint32_t value, void* stream);
 /// head-split: dst[t][lo..hi) = src[t][0..hi-lo) for `rows` rows - a part's logits into the full-vocab row, read
 /// through volatile (the source can be mapped host memory a peer GPU wrote).  Graph-capturable.
 void join_range(float* dst, int64_t n, const float* src, int64_t lo, int64_t hi, int64_t nsrc, int rows, void* stream);

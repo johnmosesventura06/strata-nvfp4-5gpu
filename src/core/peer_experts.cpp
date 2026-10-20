@@ -6,6 +6,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -53,6 +54,7 @@ PeerExperts::~PeerExperts() { close(); }
 
 void PeerExperts::close() {
     if (device_ < 0) return;
+    device_close();
     {
         On on(device_);
         if (stream_) cudaStreamSynchronize(stream_);
@@ -313,6 +315,7 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
         res_[out] = kNotResident;              // evicted now: the CPU computes it meanwhile
         pending_.emplace_back((int32_t) in, slot);
         ++swaps_;
+        res_dev_dirty_ = true;                 // STRATA_DEVICE_TIERS: uploaded before the next window's graph
     }
     return ck(cudaEventRecord(refill_ev_, refill_), "refill event", err);
 }
@@ -326,6 +329,129 @@ void PeerExperts::apply_pending(bool wait) {
     }
     for (const auto& [i, slot] : pending_) res_[(size_t) i] = slot;
     pending_.clear();
+    res_dev_dirty_ = true;
+}
+
+// ---- STRATA_DEVICE_TIERS (see the header)
+
+void PeerExperts::device_close() {
+    if (device_ < 0) return;
+    On on(device_);
+    if (dstream_) cudaStreamSynchronize(dstream_);
+    for (auto& g : dgraphs_) cudaGraphExecDestroy(g.exec);
+    dgraphs_.clear();
+    for (void* p : {(void*) d_res_, (void*) d_slot_off_, (void*) d_plan_, (void*) dx_, (void*) dout_, (void*) dq8_, dscratch_})
+        if (p != nullptr) cudaFree(p);
+    if (dstream_) cudaStreamDestroy(dstream_);
+    d_res_ = nullptr; d_slot_off_ = nullptr; d_plan_ = nullptr; dx_ = dout_ = nullptr; dq8_ = nullptr; dscratch_ = nullptr;
+    dstream_ = nullptr;
+    dev_ready_ = false;
+}
+
+bool PeerExperts::device_open(int max_t, int k, std::string& err) {
+    if (device_ < 0) { err = "peer experts: the device path needs an open tier"; return false; }
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native) { err = "peer experts: the device path needs a native pack"; return false; }
+    if (max_t < 1 || k < 1 || (long long) max_t * k > 128 || (long long) max_t * k > CAP) {
+        err = "peer experts: the device path takes windows of at most 128 entries";
+        return false;
+    }
+    device_close();
+    On on(device_);
+    dev_max_t_ = max_t;
+    dev_k_ = k;
+    dev_capx_ = (long long) max_t * k;
+    const long long capx = dev_capx_;
+    const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+    const size_t plan_i32 = (size_t) (ptr_off + 4 * capx + capx + 1 + 16);
+    int64_t ff = strata::kernels::cpu::FF;
+    for (const auto& f : lay.fmt) ff = std::max<int64_t>(ff, f.n_ff);
+    int prio_lo = 0, prio_hi = 0;
+    cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi);
+    const uint64_t* off = cache_.slot_offsets();
+    const bool ok =
+        ck(cudaStreamCreateWithPriority(&dstream_, cudaStreamNonBlocking, prio_hi), "device stream", err) &&
+        ck(cudaMalloc((void**) &d_res_, res_.size() * sizeof(int32_t)), "device residency", err) &&
+        ck(cudaMalloc((void**) &d_plan_, plan_i32 * sizeof(int32_t)), "device plan", err) &&
+        ck(cudaMalloc((void**) &dx_, (size_t) max_t * H * sizeof(float)), "device input", err) &&
+        ck(cudaMalloc((void**) &dout_, (size_t) capx * H * sizeof(float)), "device result", err) &&
+        ck(cudaMalloc((void**) &dq8_, (size_t) max_t * (H / 32) * 36), "device activations", err) &&
+        ck(cudaMalloc(&dscratch_, strata::kernels::native_expert_scratch_bytes(capx, ff)), "device scratch", err) &&
+        (off == nullptr || ck(cudaMalloc((void**) &d_slot_off_, (size_t) resident_ * sizeof(unsigned long long)), "slot offsets", err)) &&
+        (off == nullptr || ck(cudaMemcpy(d_slot_off_, off, (size_t) resident_ * sizeof(unsigned long long), cudaMemcpyHostToDevice), "slot offsets", err)) &&
+        ck(cudaMemcpy(d_res_, res_.data(), res_.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "residency", err);
+    if (!ok) { device_close(); return false; }
+    d_base_ = cache_.device_slot(0);   // slot 0 sits at offset 0 either way
+    d_blob_ = off == nullptr ? (long long) cache_.slot_offset(1) : 0;
+    res_dev_dirty_ = false;
+    dev_ready_ = true;
+    return true;
+}
+
+bool PeerExperts::device_launch(const DeviceWindow& w, std::string& err) {
+    if (!dev_ready_) { err = "peer experts: the device path is not open"; return false; }
+    if (w.T < 1 || w.T > dev_max_t_ || w.k != dev_k_ || w.G < 1 || w.G > 2 || w.le <= w.lb ||
+        w.seq == nullptr || w.x == nullptr || w.ids == nullptr || w.rows == nullptr || w.done == nullptr) {
+        err = "peer experts: a device window out of range";
+        return false;
+    }
+    On on(device_);
+    if (res_dev_dirty_) {   // pageable source: the copy takes its snapshot before the call returns
+        if (!ck(cudaMemcpyAsync(d_res_, res_.data(), res_.size() * sizeof(int32_t), cudaMemcpyHostToDevice, dstream_),
+                "residency upload", err))
+            return false;
+        res_dev_dirty_ = false;
+    }
+    cudaGraphExec_t exec = nullptr;
+    for (const DevGraph& g : dgraphs_)
+        if (g.T == w.T && g.G == w.G && g.lb == w.lb && g.le == w.le && g.seq == (const void*) w.seq) { exec = g.exec; break; }
+    if (exec == nullptr) {
+        using namespace strata::kernels;
+        const auto& lay = cpu::expert_layout();
+        const cudaStream_t s = dstream_;
+        const long long capx = dev_capx_;
+        const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+        const int32_t* counts = d_plan_;
+        const int32_t* start = d_plan_ + 4;
+        const int32_t* dst = start + capx + 1;
+        const int32_t* tok = dst + capx;
+        const unsigned long long* ptr = (const unsigned long long*) (d_plan_ + ptr_off);
+        if (!ck(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "capture begin", err)) return false;
+        try {
+            for (int64_t step = 0; step < (w.le - w.lb) * w.G; ++step) {
+                const int64_t l = w.lb + step / w.G;
+                const int grp = (int) (step % w.G);
+                const int tb = w.gtb[grp], n = w.gte[grp] - w.gtb[grp];
+                const uint32_t ring = (uint32_t) (step + 1);
+                wait_flag_ge(w.seq, ring, s);
+                if (n > 0) {
+                    const int ne = n * w.k;
+                    copy_from_mapped(dx_, w.x + (size_t) tb * H, (int64_t) n * H, s);
+                    tier_plan(w.ids + (size_t) tb * w.k, ne, w.k, d_res_ + l * n_expert_, (int) n_expert_, d_base_,
+                              d_slot_off_, d_blob_, d_plan_, capx, s);
+                    quantize_q8_1_rows(dx_, n, H, dq8_, s);
+                    const auto& f = lay.fmt[(size_t) l];
+                    const auto L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                    native_expert_grouped(L, ptr, start, counts, dst, tok, ne, ne, dq8_, dscratch_, dout_, s);
+                    scatter_rows_counted(dout_, w.rows + (size_t) tb * w.k * H, dst, counts + 1, ne, H, s);
+                }
+                mapped_store(w.done, ring, s);
+            }
+        } catch (const std::exception& e) {
+            cudaGraph_t g = nullptr;
+            cudaStreamEndCapture(s, &g);
+            if (g) cudaGraphDestroy(g);
+            err = std::string("peer experts: device window capture: ") + e.what();
+            return false;
+        }
+        cudaGraph_t graph = nullptr;
+        if (!ck(cudaStreamEndCapture(s, &graph), "capture end", err)) return false;
+        const cudaError_t ie = cudaGraphInstantiateWithFlags(&exec, graph, 0);
+        cudaGraphDestroy(graph);
+        if (!ck(ie, "graph instantiate", err)) return false;
+        dgraphs_.push_back({w.T, w.G, w.lb, w.le, (const void*) w.seq, exec});
+    }
+    return ck(cudaGraphLaunch(exec, dstream_), "device window launch", err);
 }
 
 }  // namespace strata::core

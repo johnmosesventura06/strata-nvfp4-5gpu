@@ -554,6 +554,9 @@ struct ExpertDispatch {
     /// others through the merged residency table).
     PeerExperts* peers[kMaxPeerTiers] = {};
     int n_peers = 0;
+    /// STRATA_DEVICE_TIERS: set by the verifier for the window it runs while the tiers' own graphs serve it (they
+    /// wait on the doorbell and write their rows themselves): the pool neither launches nor waits for them.
+    bool peers_device = false;
     int64_t peer_entries = 0;      ///< routed entries the tiers served in verify windows
     /// the tier index holding (layer, expert), or -1 when no peer card does.  Defined in expert_source.cpp:
     /// peer_experts.hpp includes this header, so the tier's `has` is not visible here.
