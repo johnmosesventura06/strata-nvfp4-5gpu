@@ -154,6 +154,8 @@ public:
 
     /// Blobs touched, for the driver to report.  A source that does not count returns 0.
     virtual int64_t reads() const { return 0; }
+    /// GPU-side reads handed out (device_alias), for the driver to report.  0 when the source does not count.
+    virtual int64_t alias_reads() const { return 0; }
 
     /// Plan v0.3 P5: whether `blob(layer, expert)` lies in page-locked, CUDA-registered memory, so an
     /// asynchronous host-to-device copy can DMA it directly (no staging copy on the CPU).
@@ -984,7 +986,8 @@ public:
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
     const uint8_t* blob(int64_t layer, int64_t expert) override;
-    int64_t reads() const { return reads_; }
+    int64_t reads() const override { return reads_.load(std::memory_order_relaxed); }
+    int64_t alias_reads() const override { return alias_reads_.load(std::memory_order_relaxed); }
     bool pinned(int64_t layer, int64_t expert) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     void prefetch(int64_t layer, int64_t expert) override;
@@ -1012,7 +1015,8 @@ private:
     const uint8_t* base_ = nullptr;
     int64_t blobs_ = 0;
     int64_t n_expert_ = 0;
-    int64_t reads_ = 0;
+    std::atomic<int64_t> reads_{0};                 ///< blob() calls (the CPU, a copy's source)
+    mutable std::atomic<int64_t> alias_reads_{0};   ///< device_alias() handed out (a GPU reads the RAM copy)
     std::string note_;
     std::string ram_warning_;
     double gib_per_s_ = 0.0;

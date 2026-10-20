@@ -4379,6 +4379,7 @@ bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {
 const uint8_t* ArenaExpertSource::device_alias(int64_t layer, int64_t expert) const {
     if (dev_slice_.empty() || !pinned(layer, expert)) return nullptr;
     const auto& lay = strata::kernels::cpu::expert_layout();
+    alias_reads_.fetch_add(1, std::memory_order_relaxed);
     if (slice_bytes_ == 0) return dev_slice_[0] + lay.blob_offset(layer, expert);
     // one registration slice per layer
     if ((size_t) layer >= dev_slice_.size()) return nullptr;
@@ -4390,7 +4391,7 @@ const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
     if (layer < 0 || expert < 0 || expert >= n_expert_) return nullptr;
     const int64_t idx = layer * n_expert_ + expert;
     if (idx < 0 || idx >= blobs_) return nullptr;
-    ++reads_;
+    reads_.fetch_add(1, std::memory_order_relaxed);
     // Pointer arithmetic into resident memory.  No fault, no copy, no mapping - which is the entire point of
     // this class over `FileExpertSource`.
     return base_ + strata::kernels::cpu::expert_layout().blob_offset(layer, expert);

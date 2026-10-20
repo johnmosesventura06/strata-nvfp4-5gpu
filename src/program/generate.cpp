@@ -11251,6 +11251,7 @@ int main(int argc, char** argv) {
             const int64_t decode_hits0 = drive.d.cache_hits;
             // CS-T: the RAM and file tiers of this request (the mmap source; 0 with the arena)
             const int64_t ram0 = src.ram_reads(), files0 = src.file_reads();
+            const int64_t req_ram_r0 = srcp->reads(), req_ram_a0 = srcp->alias_reads();   // the expert RAM copy, this request
             const uint64_t file_bytes0 = src.file_read_bytes();
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
             const int64_t offload0 = drive.d.offload_entries;   // #588
@@ -12291,6 +12292,16 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: decode expert cache hit rate: %.1f%% (%lld hits / %lld lookups)%s\n",
                              100.0 * (double) req_hits / (double) req_look,
                              (long long) req_hits, (long long) req_look, off);
+            }
+            // the expert RAM copy, since the first request: blobs read (CPU work, copies' sources) and GPU-side reads
+            // handed out (a device alias) - with every expert on a GPU this should stay at (about) zero
+            {
+                static int64_t ram_r0 = -1, ram_a0 = 0;
+                if (ram_r0 < 0) { ram_r0 = req_ram_r0; ram_a0 = req_ram_a0; }
+                std::fprintf(stderr, "strata serve: expert RAM copy since the first request: %lld blob reads, %lld GPU reads "
+                                     "(this request %lld / %lld)\n",
+                             (long long) (srcp->reads() - ram_r0), (long long) (srcp->alias_reads() - ram_a0),
+                             (long long) (srcp->reads() - req_ram_r0), (long long) (srcp->alias_reads() - req_ram_a0));
             }
             // the resident RAM mode, cumulative: experts read from experts.bin since the copy was made (what the plain
             // mmap mode reads through the OS file cache, from the SSD when the RAM could not keep it)
