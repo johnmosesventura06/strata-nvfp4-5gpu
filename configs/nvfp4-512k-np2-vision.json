@@ -80,7 +80,9 @@
   "STRATA_BATCH_CONC_SHARE": "0.75",
   "STRATA_CONV_POOL_MIB": "4096",
   "STRATA_DEVICE_TIERS": "2",
-  "STRATA_LEND_SHADOW": "1"
+  "STRATA_LEND_SHADOW": "1",
+  "STRATA_GR_V6": "5",
+  "STRATA_MMA_Q8": "1"
  },
  "host": "0.0.0.0",
  "port": 8190,
