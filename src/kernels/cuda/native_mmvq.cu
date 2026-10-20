@@ -46,6 +46,7 @@
 #include <unordered_map>
 #include <cstdio>
 #include <vector>
+#include <type_traits>
 
 namespace strata::kernels {
 namespace {
@@ -1595,6 +1596,268 @@ void wave_launch(const void* weights, const void* x_q8_1, float* y, int n_in, in
 #define STRATA_WAVE_MMVQ(...)
 #endif
 
+
+// STRATA_MMA_Q8=1: the Q8_0 GEMV on the int8 tensor cores (sm_80+), for every column count 1..8 and the pair
+// launch.  A warp owns 16 rows x 8 columns: per 32-element block one mma.m16n8k32 gives every (row, column)'s exact
+// integer dot (dp4a's integers summed in int32), then acc += d_w * d_x * dot in block order.  The KW warps of a
+// block take U consecutive blocks each in turn and are added in warp order at the end.  A column's sums never see
+// another column (its B lanes are its own, the others' are 0 or never stored), so a column of an 8-column call is
+// bitwise the same column called alone - the multi_exact contract - but not bitwise the dp4a kernels (they round
+// each quarter block's product separately; here a whole block's integer is scaled once).
+bool g_mma_q8 = [] { const char* v = std::getenv("STRATA_MMA_Q8"); return v != nullptr && v[0] == '1'; }();
+int g_mma_q8_cfg = [] { const char* v = std::getenv("STRATA_MMA_Q8_CFG"); return v ? std::atoi(v) : 0; }();
+bool mma_q8_device_ok() {
+    static int ok[16] = {};   // 0 unknown, 1 yes, 2 no
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return false;
+    if (ok[dev] == 0) {
+        int major = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        ok[dev] = major >= 8 ? 1 : 2;
+    }
+    return ok[dev] == 1;
+}
+template <int NCOLS, int KW, int U>
+__launch_bounds__(KW * WARP)
+__global__ void q8_0_mma_kernel(const Q80Block* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y,
+                                int n_in, int n_out, const Q80Block* __restrict__ w2, float* __restrict__ y2) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    int bx = int(blockIdx.x);
+    const int tiles = (n_out + 15) / 16;
+    if (w2 != nullptr && bx >= tiles) { bx -= tiles; w = w2; y = y2; }
+    const int lane = int(threadIdx.x) & 31, warp = int(threadIdx.x) >> 5;
+    const int g = lane >> 2, tig = lane & 3;
+    const int nb = n_in / 32;
+    const int r0 = bx * 16 + g, r1 = r0 + 8;
+    const Q80Block* w0 = w + std::size_t(min(r0, n_out - 1)) * nb;
+    const Q80Block* w1 = w + std::size_t(min(r1, n_out - 1)) * nb;
+    const bool bcol = g < NCOLS;                      // this lane's B column is g
+    const Q81Block* xb = x + std::size_t(bcol ? g : 0) * nb;
+    const int c0 = 2 * tig, c1 = c0 + 1;              // its C columns
+    const Q81Block* xs0 = x + std::size_t(c0 < NCOLS ? c0 : 0) * nb;
+    const Q81Block* xs1 = x + std::size_t(c1 < NCOLS ? c1 : 0) * nb;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int kb0 = warp * U; kb0 < nb; kb0 += KW * U) {
+        int a[U][4], b[U][2];
+        float dw[U][2], dx[U][2];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int kb = min(kb0 + u, nb - 1);
+            a[u][0] = load_int_b2(w0[kb].qs, tig);
+            a[u][1] = load_int_b2(w1[kb].qs, tig);
+            a[u][2] = load_int_b2(w0[kb].qs, 4 + tig);
+            a[u][3] = load_int_b2(w1[kb].qs, 4 + tig);
+            dw[u][0] = __half2float(w0[kb].d);
+            dw[u][1] = __half2float(w1[kb].d);
+            const int* q = reinterpret_cast<const int*>(xb[kb].qs);
+            b[u][0] = bcol ? q[tig] : 0;
+            b[u][1] = bcol ? q[4 + tig] : 0;
+            dx[u][0] = __low2float(xs0[kb].ds);
+            dx[u][1] = __low2float(xs1[kb].ds);
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            if (kb0 + u >= nb) break;
+            int c[4];
+            asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                         "{%10,%10,%10,%10};\n"
+                         : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
+                         : "r"(a[u][0]), "r"(a[u][1]), "r"(a[u][2]), "r"(a[u][3]), "r"(b[u][0]), "r"(b[u][1]), "r"(0));
+            acc[0] += dw[u][0] * dx[u][0] * float(c[0]);   // row r0, column c0
+            acc[1] += dw[u][0] * dx[u][1] * float(c[1]);   // row r0, column c1
+            acc[2] += dw[u][1] * dx[u][0] * float(c[2]);   // row r1, column c0
+            acc[3] += dw[u][1] * dx[u][1] * float(c[3]);   // row r1, column c1
+        }
+    }
+    if constexpr (KW > 1) {
+        __shared__ float red[KW - 1][4][WARP];
+        if (warp > 0) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) red[warp - 1][i][lane] = acc[i];
+        }
+        __syncthreads();
+        if (warp > 0) return;
+#pragma unroll
+        for (int v = 0; v < KW - 1; ++v)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) acc[i] += red[v][i][lane];
+    }
+    if (r0 < n_out) {
+        if (c0 < NCOLS) y[std::size_t(c0) * n_out + r0] = acc[0];
+        if (c1 < NCOLS) y[std::size_t(c1) * n_out + r0] = acc[1];
+    }
+    if (r1 < n_out) {
+        if (c0 < NCOLS) y[std::size_t(c0) * n_out + r1] = acc[2];
+        if (c1 < NCOLS) y[std::size_t(c1) * n_out + r1] = acc[3];
+    }
+#endif
+}
+
+// The same tile and sums, with the weights read coalesced: a warp takes U2 = 4 consecutive blocks of its 16 rows at a
+// time (16 x 136 contiguous, 8-byte-aligned bytes when n_in / 32 % 4 == 0) with 8-byte loads into its own shared
+// buffer (the next chunk's loads in flight while this one is multiplied), then builds the fragments from there.
+// Chunk c of a row goes to warp c % KW; per (row, column) the blocks are added in block order within a warp and the
+// warps in warp order, so the sums depend only on the shape and KW (q8_0_mma_kw), never on the column count.
+constexpr int MMA_U2 = 4, MMA_CH_U2 = MMA_U2 * 34 / 8;   // 17 uint2 per row chunk
+template <int NCOLS, int KW>
+__launch_bounds__(KW * WARP)
+__global__ void q8_0_mma2_kernel(const Q80Block* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y,
+                                 int n_in, int n_out, const Q80Block* __restrict__ w2, float* __restrict__ y2) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    __shared__ uint2 tile[KW][16 * MMA_CH_U2];
+    int bx = int(blockIdx.x);
+    const int tiles = (n_out + 15) / 16;
+    if (w2 != nullptr && bx >= tiles) { bx -= tiles; w = w2; y = y2; }
+    const int lane = int(threadIdx.x) & 31, warp = int(threadIdx.x) >> 5;
+    const int g = lane >> 2, tig = lane & 3;
+    const int nb = n_in / 32, nch = nb / MMA_U2;
+    const int r0 = bx * 16 + g, r1 = r0 + 8;
+    const bool bcol = g < NCOLS;
+    const Q81Block* xb = x + std::size_t(bcol ? g : 0) * nb;
+    const int c0 = 2 * tig, c1 = c0 + 1;
+    const Q81Block* xs0 = x + std::size_t(c0 < NCOLS ? c0 : 0) * nb;
+    const Q81Block* xs1 = x + std::size_t(c1 < NCOLS ? c1 : 0) * nb;
+    // this lane's share of a chunk: elements e = lane + 32 i of the 16 x 17 uint2
+    constexpr int NE = (16 * MMA_CH_U2 + WARP - 1) / WARP;   // 9
+    const uint2* src[NE];
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        const int e = lane + WARP * i, row = min(e / MMA_CH_U2, 15), col = e - (e / MMA_CH_U2) * MMA_CH_U2;
+        const int rr = min(bx * 16 + row, n_out - 1);
+        src[i] = reinterpret_cast<const uint2*>(w + std::size_t(rr) * nb) + col;
+    }
+    uint2 bufa[NE], bufb[NE];   // two chunks in flight
+    auto fetch = [&](uint2 (&buf)[NE], int ch) {
+#pragma unroll
+        for (int i = 0; i < NE; ++i)
+            if (lane + WARP * i < 16 * MMA_CH_U2) buf[i] = __ldg(src[i] + std::size_t(ch) * MMA_CH_U2);
+    };
+    uint2* tw = tile[warp];
+    const uint16_t* th = reinterpret_cast<const uint16_t*>(tw);
+    const int* ti = reinterpret_cast<const int*>(tw);
+    auto qint = [&](int row, int boff) -> int {       // the int at byte boff of `row`'s chunk (2-byte aligned)
+        const int o = row * (MMA_CH_U2 * 8) + boff;
+        if (o & 2) return __funnelshift_r(ti[o >> 2], ti[(o >> 2) + 1], 16);
+        return ti[o >> 2];
+    };
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    auto mma_chunk = [&](int ch) {
+#pragma unroll
+        for (int u = 0; u < MMA_U2; ++u) {
+            const int kb = ch * MMA_U2 + u;
+            const int bo = u * 34;
+            const int a0 = qint(g, bo + 2 + 4 * tig), a1 = qint(g + 8, bo + 2 + 4 * tig);
+            const int a2 = qint(g, bo + 18 + 4 * tig), a3 = qint(g + 8, bo + 18 + 4 * tig);
+            const float dw0 = __half2float(__ushort_as_half(th[(g * MMA_CH_U2 * 8 + bo) >> 1]));
+            const float dw1 = __half2float(__ushort_as_half(th[((g + 8) * MMA_CH_U2 * 8 + bo) >> 1]));
+            const int* q = reinterpret_cast<const int*>(xb[kb].qs);
+            const int b0 = bcol ? q[tig] : 0, b1 = bcol ? q[4 + tig] : 0;
+            const float dx0 = __low2float(xs0[kb].ds), dx1 = __low2float(xs1[kb].ds);
+            int c[4];
+            asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                         "{%10,%10,%10,%10};\n"
+                         : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
+                         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(0));
+            acc[0] += dw0 * dx0 * float(c[0]);
+            acc[1] += dw0 * dx1 * float(c[1]);
+            acc[2] += dw1 * dx0 * float(c[2]);
+            acc[3] += dw1 * dx1 * float(c[3]);
+        }
+    };
+    auto stage = [&](const uint2 (&buf)[NE]) {
+        __syncwarp();
+#pragma unroll
+        for (int i = 0; i < NE; ++i)
+            if (lane + WARP * i < 16 * MMA_CH_U2) tw[lane + WARP * i] = buf[i];
+        __syncwarp();
+    };
+    int ch = warp;
+    if (ch < nch) fetch(bufa, ch);
+    if (ch + KW < nch) fetch(bufb, ch + KW);
+    for (; ch < nch; ch += 2 * KW) {
+        stage(bufa);
+        if (ch + 2 * KW < nch) fetch(bufa, ch + 2 * KW);
+        mma_chunk(ch);
+        if (ch + KW >= nch) break;
+        stage(bufb);
+        if (ch + 3 * KW < nch) fetch(bufb, ch + 3 * KW);
+        mma_chunk(ch + KW);
+    }
+    if constexpr (KW > 1) {
+        __syncthreads();
+        float* red = reinterpret_cast<float*>(&tile[0][0]);   // [KW - 1][4][32] after every warp is done with its tile
+        if (warp > 0) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) red[((warp - 1) * 4 + i) * WARP + lane] = acc[i];
+        }
+        __syncthreads();
+        if (warp > 0) return;
+#pragma unroll
+        for (int v = 0; v < KW - 1; ++v)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) acc[i] += red[(v * 4 + i) * WARP + lane];
+    }
+    if (r0 < n_out) {
+        if (c0 < NCOLS) y[std::size_t(c0) * n_out + r0] = acc[0];
+        if (c1 < NCOLS) y[std::size_t(c1) * n_out + r0] = acc[1];
+    }
+    if (r1 < n_out) {
+        if (c0 < NCOLS) y[std::size_t(c0) * n_out + r1] = acc[2];
+        if (c1 < NCOLS) y[std::size_t(c1) * n_out + r1] = acc[3];
+    }
+#endif
+}
+template <int NCOLS>
+void q8_0_mma_launch_n(const Q80Block* w, const Q81Block* x, float* y, int n_in, int n_out, const Q80Block* w2,
+                       float* y2, cudaStream_t s) {
+    const unsigned grid = unsigned((n_out + 15) / 16 * (w2 ? 2 : 1));
+    const int nch = n_in / 32 / MMA_U2;
+    if ((n_in / 32) % MMA_U2 == 0 && g_mma_q8_cfg == 0) {   // default: KW by shape - the most warps (<= 16) that split
+        // the row's chunks evenly with at least 2 each (a function of n_in alone, so of no column count)
+        int kw = 4;
+        for (int c : {16, 10, 8, 5, 4})
+            if (nch % c == 0 && nch / c >= 2) { kw = c; break; }
+        switch (kw) {
+            case 16: q8_0_mma2_kernel<NCOLS, 16><<<grid, 16 * WARP, 0, s>>>(w, x, y, n_in, n_out, w2, y2); return;
+            case 10: q8_0_mma2_kernel<NCOLS, 10><<<grid, 10 * WARP, 0, s>>>(w, x, y, n_in, n_out, w2, y2); return;
+            case 8: q8_0_mma2_kernel<NCOLS, 8><<<grid, 8 * WARP, 0, s>>>(w, x, y, n_in, n_out, w2, y2); return;
+            case 5: q8_0_mma2_kernel<NCOLS, 5><<<grid, 5 * WARP, 0, s>>>(w, x, y, n_in, n_out, w2, y2); return;
+            default: q8_0_mma2_kernel<NCOLS, 4><<<grid, 4 * WARP, 0, s>>>(w, x, y, n_in, n_out, w2, y2); return;
+        }
+    }
+    if ((n_in / 32) % MMA_U2 == 0 && g_mma_q8_cfg >= 10) {   // the coalesced kernel; KW by cfg (10: 4, 11: 8, 12: 16)
+        switch (g_mma_q8_cfg) {
+            case 10: q8_0_mma2_kernel<NCOLS, 4><<<grid, 4 * WARP, 0, s>>>(w, x, y, n_in, n_out, w2, y2); return;
+            case 12: q8_0_mma2_kernel<NCOLS, 16><<<grid, 16 * WARP, 0, s>>>(w, x, y, n_in, n_out, w2, y2); return;
+            default: q8_0_mma2_kernel<NCOLS, 8><<<grid, 8 * WARP, 0, s>>>(w, x, y, n_in, n_out, w2, y2); return;
+        }
+    }
+    switch (g_mma_q8_cfg) {
+        case 1: q8_0_mma_kernel<NCOLS, 8, 2><<<grid, 8 * WARP, 0, s>>>(w, x, y, n_in, n_out, w2, y2); break;
+        case 2: q8_0_mma_kernel<NCOLS, 4, 2><<<grid, 4 * WARP, 0, s>>>(w, x, y, n_in, n_out, w2, y2); break;
+        case 3: q8_0_mma_kernel<NCOLS, 8, 4><<<grid, 8 * WARP, 0, s>>>(w, x, y, n_in, n_out, w2, y2); break;
+        default: q8_0_mma_kernel<NCOLS, 4, 4><<<grid, 4 * WARP, 0, s>>>(w, x, y, n_in, n_out, w2, y2); break;
+    }
+}
+void q8_0_mma_launch(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, const void* w2, float* y2,
+                     void* stream) {
+    const auto* a = static_cast<const Q80Block*>(w);
+    const auto* b = static_cast<const Q80Block*>(w2);
+    const auto* xq = static_cast<const Q81Block*>(x);
+    const auto s = static_cast<cudaStream_t>(stream);
+    switch (ncols) {
+        case 1: q8_0_mma_launch_n<1>(a, xq, y, n_in, n_out, b, y2, s); break;
+        case 2: q8_0_mma_launch_n<2>(a, xq, y, n_in, n_out, b, y2, s); break;
+        case 3: q8_0_mma_launch_n<3>(a, xq, y, n_in, n_out, b, y2, s); break;
+        case 4: q8_0_mma_launch_n<4>(a, xq, y, n_in, n_out, b, y2, s); break;
+        case 5: q8_0_mma_launch_n<5>(a, xq, y, n_in, n_out, b, y2, s); break;
+        case 6: q8_0_mma_launch_n<6>(a, xq, y, n_in, n_out, b, y2, s); break;
+        case 7: q8_0_mma_launch_n<7>(a, xq, y, n_in, n_out, b, y2, s); break;
+        default: q8_0_mma_launch_n<8>(a, xq, y, n_in, n_out, b, y2, s); break;
+    }
+}
+bool q8_0_mma_on() { return g_mma_q8 && mma_q8_device_ok(); }
+
 template<typename Weight, int Qi>
 void small_mmvq(const void* weights, const void* x_q8_1, float* y,
                 int n_in, int n_out, int ncols, void* stream) {
@@ -1604,6 +1867,19 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
+    if constexpr (std::is_same_v<Weight, Q80Block>) {
+        static const bool log_shapes = std::getenv("STRATA_MMVQ_LOG") != nullptr;   // each new (n_in, n_out, ncols) once
+        if (log_shapes) {
+            static std::unordered_map<long long, int> seen;
+            if (seen[((long long) n_in << 32) | ((long long) n_out << 4) | ncols]++ == 0)
+                std::fprintf(stderr, "strata: mmvq Q8_0 n_in %d n_out %d ncols %d\n", n_in, n_out, ncols);
+        }
+        if (ncols >= 1 && ncols <= 8 && (ncols == 1 || g_multi_exact) && q8_0_mma_on()) {   // STRATA_MMA_Q8=1 (the EXACT contract)
+            q8_0_mma_launch(weights, x_q8_1, y, n_in, n_out, ncols, nullptr, nullptr, stream);
+            launch_check();
+            return;
+        }
+    }
     STRATA_WAVE_MMVQ(SmallTraits<Weight, Qi>)
     if (ncols > 1) {
         launch_multi<SmallTraits<Weight, Qi>>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
@@ -2131,6 +2407,7 @@ void native_q6_k_unpack(const void* weights) {
 }
 
 void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
+void native_q8_0_set_mma(bool on, int cfg) { g_mma_q8 = on; g_mma_q8_cfg = cfg; }
 bool native_mmvq_multi_exact() { return g_multi_exact; }
 
 std::size_t native_q8_1_bytes(int n_in, int ncols) {
@@ -2447,6 +2724,11 @@ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void*
     if (ggml_type != 8 || !g_multi_exact || ncols < 2 || ncols > 8 || n_out <= 0 || n_in <= 0 || n_in % 32 != 0 ||
         n_in / F::DIV < F::BPI || !w1 || !w2 || !x_q8_1 || !y1 || !y2 || !stream)
         return false;
+    if (q8_0_mma_on()) {   // STRATA_MMA_Q8=1: both matrices in one launch of the tensor-core kernel
+        q8_0_mma_launch(w1, x_q8_1, y1, n_in, n_out, ncols, w2, y2, stream);
+        launch_check();
+        return true;
+    }
     const auto& reg = q8_packed_registry();
     if (reg.count(w1) || reg.count(w2)) return false;
     const auto* a = static_cast<const Q80Block*>(w1);
@@ -2473,6 +2755,7 @@ void native_mmvq_set_v2(bool on) { g_mmvq_v2 = on; }
 bool native_q8_0_mmvq_group(int n, const void* const* weights, float* const* y, const int* n_out, const void* x_q8_1,
                             int n_in, int ncols, void* stream) {
     if (!g_mmvq_v2 || n < 1 || n > V2_MAX_MATS || ncols < 1 || ncols > 8 || n_in <= 0 || n_in % 32 != 0) return false;
+    if (q8_0_mma_on()) return false;   // STRATA_MMA_Q8=1: one call per matrix on the tensor-core kernel
     if (ncols > 1 && !g_multi_exact) return false;   // the group kernel is the EXACT layout
     if (!x_q8_1 || !stream) return false;
     const auto& reg = q8_packed_registry();
@@ -2503,7 +2786,7 @@ bool native_q8_0_mmvq_group(int n, const void* const* weights, float* const* y, 
 
 void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
-    if (q8_packed_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;   // STRATA_Q8_PACKED=1 tensors
+    if (!q8_0_mma_on() && q8_packed_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;   // STRATA_Q8_PACKED=1 tensors
     small_mmvq<Q80Block, 8>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
 }
 

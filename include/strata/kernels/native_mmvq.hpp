@@ -31,6 +31,8 @@ std::size_t native_q8_1_bytes(int n_in, int ncols = 1);
 // graph capture; captured graphs keep the kernels they captured.
 void native_mmvq_set_multi_exact(bool exact);
 bool native_mmvq_multi_exact();
+// STRATA_MMA_Q8 (tests): the tensor-core Q8_0 GEMV on or off, cfg = its warps x blocks variant (0 = 4 x 4)
+void native_q8_0_set_mma(bool on, int cfg = 0);
 
 // One quantization may serve multiple weight matrices sharing the same input.
 // Q8_1 stores FP16 scale and FP16 warp sum of the ORIGINAL float inputs; it does
