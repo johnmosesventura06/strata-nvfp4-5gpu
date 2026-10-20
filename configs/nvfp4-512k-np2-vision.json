@@ -27,7 +27,7 @@
   "--peer-devices",
   "1,2,3,4",
   "--peer-reserve-mib",
-  "768",
+  "1024",
   "--max-context",
   "524288",
   "--kv",
@@ -58,7 +58,9 @@
   "--conversation-cache-dir",
   "journal",
   "--ple-row-cache",
-  "5000000"
+  "5000000",
+  "--ram-budget",
+  "4"
  ],
  "sampling": {
   "temperature": 1.0,
@@ -82,7 +84,7 @@
  },
  "host": "0.0.0.0",
  "port": 8190,
- "parallel": 3,
+ "parallel": 4,
  "vision": {
   "exe": "build-vision-cpu/bin/strata-vision",
   "mmproj": "../models/original-tables/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
