@@ -132,8 +132,11 @@ void mapped_bump(uint32_t* flag, void* stream);
 /// the main GPU's doorbell wrote), the ones whose expert the tier holds (res[e] >= 0) - the distinct experts in
 /// routing order, each one's entries ascending (the host pool's order).  Layout as resident_plan's (counts | start |
 /// dst | tok | pad | ptr | ptr2 | start2, `capx` entries); counts[0] groups, counts[1] entries, counts[2] 0.  n <= 128.
+/// `main_res_layer` (optional, the main's residency table, read over P2P): an expert the main holds as well stays
+/// the main's (its adaptive tier may admit one a tier still holds).
 void tier_plan(const int32_t* ids, int n, int k, const int32_t* res_layer, int n_expert, const uint8_t* cache_base,
-               const unsigned long long* slot_off, long long blob, int32_t* plan, long long capx, void* stream);
+               const unsigned long long* slot_off, long long blob, int32_t* plan, long long capx, void* stream,
+               const int32_t* main_res_layer = nullptr);
 /// out[dst[r]] = src[dst[r]] (`width` floats a row, a multiple of 4) for r < *count (device memory), launched for
 /// `cap` rows: the tier's computed rows into the main's mapped rows, the count known only on the device.
 void scatter_rows_counted(const float* src, float* out, const int32_t* dst, const int32_t* count, int cap,
@@ -141,6 +144,22 @@ void scatter_rows_counted(const float* src, float* out, const int32_t* dst, cons
 /// *flag = value once the stream's earlier work is visible system-wide (a store, not an increment: the reader
 /// waits for its ring number with wait_flag_ge).  Graph-capturable.
 void mapped_store(uint32_t* flag, uint32_t value, void* stream);
+/// STRATA_DEVICE_TIERS=2: the tier's rows weighted and summed per token, into the main's VRAM over P2P:
+/// sums[t][:] = sum over the planned entries of token t (entry order) of weights[i] * rows[i][:] (fmaf, the
+/// first product rounded), zeros for a token the tier has none of; `weights` the main's routing weights of the group
+/// (read over P2P), `rows` the grouped kernel's output (row = entry).  The kernel's last block then stores `ring`
+/// into *done (mapped) once every block's writes are visible system-wide; `counter` (device, zero) is its scratch.
+void tier_sums(const float* rows, const int32_t* dst, const int32_t* tok, const int32_t* count, const float* weights,
+               int n_tok, int k, int64_t width, float* sums, uint32_t* done, uint32_t ring, unsigned* counter,
+               void* stream);
+/// copy_rows_from_mapped, except that a row whose expert a tier holds (owner[ids[row]] >= 0, the main's copy of the
+/// tiers' residency, -1 = none) is written zero instead of read: STRATA_DEVICE_TIERS=2 adds the tiers' sums after
+/// the combine instead.
+void copy_rows_from_mapped_owned(float* dst, const float* src, int64_t rows, int64_t width, const int32_t* hit_rows,
+                                 const int32_t* count, const int32_t* ids, const int32_t* owner_layer, void* stream);
+/// out[t][:] += sums[p][t][:] for the tiers p in order (stride `tier_stride` floats between tiers), n_tok rows.
+void add_tier_sums(float* out, const float* sums, int n_tiers, int64_t tier_stride, int n_tok, int64_t width,
+                   void* stream);
 /// head-split: dst[t][lo..hi) = src[t][0..hi-lo) for `rows` rows - a part's logits into the full-vocab row, read
 /// through volatile (the source can be mapped host memory a peer GPU wrote).  Graph-capturable.
 void join_range(float* dst, int64_t n, const float* src, int64_t lo, int64_t hi, int64_t nsrc, int rows, void* stream);

@@ -414,6 +414,8 @@ Verifier::~Verifier() {
         if (e) cudaEventDestroy(e);
     if (arena_) cudaFree(arena_);
     if (ple_scratch_b_) cudaFree(ple_scratch_b_);
+    if (tsum_) cudaFree(tsum_);
+    if (d_owner_) cudaFree(d_owner_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
                      h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_bal_, h_dt_done_};
     for (void* h : hosts)
@@ -421,7 +423,7 @@ Verifier::~Verifier() {
 }
 
 bool Verifier::set_device_tiers(int n, std::function<bool(const DeviceTierWindow&, std::string&)> begin,
-                                std::string& err) {
+                                std::string& err, bool sums) {
     if (n < 0 || n > 8) { err = "verify: device tiers: 0 to 8 tiers"; return false; }
     if (n > 0 && (device_plan_ || remote_opt_ != nullptr)) {
         err = "verify: device tiers: not with STRATA_VERIFY_DEVICE_PLAN or --remote-expert-opt";
@@ -435,8 +437,29 @@ bool Verifier::set_device_tiers(int n, std::function<bool(const DeviceTierWindow
         h_dt_done_ = (uint32_t*) h;
         for (int p = 0; p < 8; ++p) dt_done_ptr_[p] = (uint32_t*) d + p * 16;
     }
+    if (n > 0 && sums && tsum_ == nullptr) {
+        const size_t ne = (size_t) g_->n_layers * (size_t) g_->n_expert;
+        if (cudaMalloc((void**) &tsum_, (size_t) 8 * max_t_ * g_->n_embd * sizeof(float)) != cudaSuccess ||
+            cudaMalloc((void**) &d_owner_, ne * sizeof(int32_t)) != cudaSuccess ||
+            cudaMemset(d_owner_, 0xff, ne * sizeof(int32_t)) != cudaSuccess) {
+            cudaGetLastError();
+            err = "verify: device tiers: the sums buffer";
+            return false;
+        }
+    }
     dt_n_ = n;
+    dt_sums_ = n > 0 && sums;
     dt_begin_ = std::move(begin);
+    return true;
+}
+
+bool Verifier::upload_tier_owner(const int32_t* owner, size_t n, std::string& err) {
+    if (d_owner_ == nullptr || n != (size_t) g_->n_layers * (size_t) g_->n_expert) { err = "verify: tier owner table"; return false; }
+    const OnDevice on_device(device_);
+    if (cudaMemcpy(d_owner_, owner, n * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+        err = "verify: tier owner upload";
+        return false;
+    }
     return true;
 }
 
@@ -457,6 +480,12 @@ bool Verifier::dt_launch(int T, int G, const int* gtb, const int* gte, std::stri
     for (int i = 0; i < 2; ++i) { w.gtb[i] = gtb[i]; w.gte[i] = gte[i]; }
     w.k = (int) ss_->k;
     w.T = T;
+    float* sums[8] = {};
+    for (int p = 0; p < dt_n_; ++p) sums[p] = dt_sums_ ? tsum_ + (size_t) p * max_t_ * g_->n_embd : nullptr;
+    w.sum_mode = dt_sums_;
+    w.w = w_;
+    w.sums = sums;
+    w.main_res = hits_.d_res;
     if (!dt_begin_ || !dt_begin_(w, err)) {
         if (err.empty()) err = "verify: device tiers: no launch hook";
         return false;
@@ -1662,6 +1691,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 23, grp);
                 if (remote_opt_)   // #578: the helper's rows come back reduced; skip them as well
                     remote_opt_->copy_rows(parts_out, m_ymiss_ + (size_t) tb * K * N, tb, n, p_dst, p_counts + 1, cs);
+                else if (dt_sums_)   // STRATA_DEVICE_TIERS=2: the tiers' rows arrive summed (added after the combine)
+                    copy_rows_from_mapped_owned(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N, p_dst,
+                                                p_counts + 1, ids_ + tb * K, d_owner_ + l * g.n_expert, cs);
                 else if (dec_batch)   // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
                     copy_rows_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N,
                                           p_dst, p_counts + 1, cs);
@@ -1689,6 +1721,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             MoEBuffers mb = ss.moe;
             mb.weights = w_ + t * K; mb.shared = shared_ + t * N;
             if (!moe_combine_parts(g, l, K, mb, parts_ + (size_t) t * K * N, bo_ + t * N, cs, err)) return false;
+        }
+        if (dt_sums_ && !ar_on()) {   // STRATA_DEVICE_TIERS=2: the tiers' per-token sums, in tier order
+            try {
+                add_tier_sums(bo_ + tb * N, tsum_ + (size_t) tb * N, dt_n_, (int64_t) max_t_ * N, n, N, cs);
+            } catch (const std::exception& e) { err = "verify tier sums: " + std::string(e.what()); return false; }
         }
         if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);

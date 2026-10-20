@@ -308,8 +308,18 @@ public:
         int gtb[2], gte[2];
         int k;
         int T;
+        bool sum_mode;                   ///< STRATA_DEVICE_TIERS=2: per-token sums into this verifier's VRAM
+        const float* w;                  ///< the routing weights (device), [rows][k]
+        float* const* sums;              ///< tier p's sums (device), [rows][n_embd]
+        const int32_t* main_res;         ///< this GPU's residency table (device): its experts stay its own
     };
-    bool set_device_tiers(int n, std::function<bool(const DeviceTierWindow&, std::string&)> begin, std::string& err);
+    /// `sums` (STRATA_DEVICE_TIERS=2): the tiers send per-token weighted sums into this GPU's memory over P2P instead
+    /// of their rows; the window copies zeros for the rows a tier holds (the ownership table, upload_tier_owner) and
+    /// adds the sums after the combine.
+    bool set_device_tiers(int n, std::function<bool(const DeviceTierWindow&, std::string&)> begin, std::string& err,
+                          bool sums = false);
+    /// STRATA_DEVICE_TIERS=2: which tier holds (layer, expert), -1 none; [n_layers * n_expert].  Between windows.
+    bool upload_tier_owner(const int32_t* owner, size_t n, std::string& err);
     int device_tiers() const { return dt_n_; }
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
 
@@ -520,6 +530,9 @@ private:
     std::function<bool(cudaStream_t, std::string&)> pre_launch_;   // set_pre_launch
     // STRATA_DEVICE_TIERS (set_device_tiers)
     int dt_n_ = 0;
+    bool dt_sums_ = false;
+    float* tsum_ = nullptr;                                          ///< the tiers' sums, [8][max_t][n_embd] (device)
+    int32_t* d_owner_ = nullptr;                                     ///< the tiers' ownership, [n_layers * n_expert]
     uint32_t* h_dt_done_ = nullptr;                                  ///< tier p's done word at [p * 16] (mapped, portable)
     uint32_t* dt_done_ptr_[8] = {};                                  ///< their device addresses
     std::function<bool(const DeviceTierWindow&, std::string&)> dt_begin_;

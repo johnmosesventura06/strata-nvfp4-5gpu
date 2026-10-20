@@ -1454,7 +1454,7 @@ namespace {
 // groups are its distinct experts in order of first occurrence, a group's entries its occurrences in increasing i
 __global__ void tier_plan_kernel(const int32_t* ids, int n, int k, const int32_t* __restrict__ res, int n_expert,
                                  const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
-                                 int32_t* __restrict__ pl, long long capx) {
+                                 int32_t* __restrict__ pl, long long capx, const int32_t* main_res) {
     __shared__ int32_t s_id[128];
     __shared__ int s_first[128], s_size[128];
     const int i = threadIdx.x;
@@ -1462,7 +1462,7 @@ __global__ void tier_plan_kernel(const int32_t* ids, int n, int k, const int32_t
     bool own = false;
     if (i < n) {
         e = ((const volatile int32_t*) ids)[i];
-        own = e >= 0 && e < n_expert && res[e] >= 0;
+        own = e >= 0 && e < n_expert && res[e] >= 0 && (main_res == nullptr || main_res[e] < 0);
         s_id[i] = own ? e : -1;
     }
     __syncthreads();
@@ -1521,10 +1521,11 @@ __global__ void mapped_store_kernel(uint32_t* flag, uint32_t value) {
 }  // namespace
 
 void tier_plan(const int32_t* ids, int n, int k, const int32_t* res_layer, int n_expert, const uint8_t* cache_base,
-               const unsigned long long* slot_off, long long blob, int32_t* plan, long long capx, void* stream) {
+               const unsigned long long* slot_off, long long blob, int32_t* plan, long long capx, void* stream,
+               const int32_t* main_res_layer) {
     if (n > 128) { std::fprintf(stderr, "tier_plan: %d entries (at most 128)\n", n); std::exit(1); }
     tier_plan_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ids, n, k, res_layer, n_expert, cache_base, slot_off, blob,
-                                                           plan, capx);
+                                                           plan, capx, main_res_layer);
     check("tier_plan");
 }
 void scatter_rows_counted(const float* src, float* out, const int32_t* dst, const int32_t* count, int cap,
@@ -1537,6 +1538,136 @@ void scatter_rows_counted(const float* src, float* out, const int32_t* dst, cons
 void mapped_store(uint32_t* flag, uint32_t value, void* stream) {
     mapped_store_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
     check("mapped_store");
+}
+
+namespace {
+// grid (column chunks of 128 float4, n_tok): block (x, t) sums token t's planned rows over its columns
+__global__ void tier_sums_kernel(const float4* __restrict__ rows, const int32_t* __restrict__ dst,
+                                 const int32_t* __restrict__ tok, const int32_t* __restrict__ count,
+                                 const float* weights, int k, int64_t w4, float4* sums, uint32_t* done, uint32_t ring,
+                                 unsigned* counter) {
+    __shared__ int s_ent[128];
+    __shared__ float s_w[128];
+    __shared__ int s_n;
+    const int t = (int) blockIdx.y;
+    if (threadIdx.x == 0) {
+        int m = 0;
+        const int c = *count;
+        for (int r = 0; r < c && m < 128; ++r)
+            if (tok[r] == t) s_ent[m++] = dst[r];
+        // the token's own routing order (entry index), not the plan's: the plan groups by expert over the whole
+        // window, so its order would depend on the other rows of the batch (and the rounding with it)
+        for (int a = 1; a < m; ++a) {
+            const int v = s_ent[a];
+            int b = a - 1;
+            while (b >= 0 && s_ent[b] > v) { s_ent[b + 1] = s_ent[b]; --b; }
+            s_ent[b + 1] = v;
+        }
+        s_n = m;
+    }
+    __syncthreads();
+    if ((int) threadIdx.x < s_n) s_w[threadIdx.x] = ((const volatile float*) weights)[s_ent[threadIdx.x]];   // over P2P
+    __syncthreads();
+    const int64_t c4 = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (c4 < w4) {
+        float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int j = 0; j < s_n; ++j) {
+            const float w = s_w[j];
+            const float4 v = rows[(int64_t) s_ent[j] * w4 + c4];
+            if (j == 0) acc = make_float4(v.x * w, v.y * w, v.z * w, v.w * w);
+            else {
+                acc.x = fmaf(v.x, w, acc.x);
+                acc.y = fmaf(v.y, w, acc.y);
+                acc.z = fmaf(v.z, w, acc.z);
+                acc.w = fmaf(v.w, w, acc.w);
+            }
+        }
+        sums[(int64_t) t * w4 + c4] = acc;
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned total = gridDim.x * gridDim.y;
+        if (atomicAdd(counter, 1u) == total - 1) {   // the last block: every block's sums are out
+            __threadfence_system();
+            *counter = 0;
+            *(volatile uint32_t*) done = ring;
+            __threadfence_system();
+        }
+    }
+}
+__global__ void copy_rows_owned_kernel(float4* __restrict__ dst, const volatile float4* src, int64_t row4,
+                                       const int32_t* __restrict__ hit_rows, const int32_t* __restrict__ count,
+                                       const int32_t* __restrict__ ids, const int32_t* __restrict__ owner) {
+    const int row = blockIdx.x;
+    __shared__ int zero;
+    if (threadIdx.x == 0) {
+        int h = 0;
+        const int c = *count;
+        for (int i = 0; i < c; ++i) h |= hit_rows[i] == row;
+        const int32_t e = ids[row];
+        zero = h || (e >= 0 && owner[e] >= 0);
+    }
+    __syncthreads();
+    float4* d = dst + (int64_t) row * row4;
+    if (zero) {
+        for (int64_t i = threadIdx.x; i < row4; i += blockDim.x) d[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    } else {
+        const float4* sr = const_cast<const float4*>(src) + (int64_t) row * row4;
+        for (int64_t i0 = threadIdx.x; i0 < row4; i0 += (int64_t) blockDim.x * 4) {
+            float4 v[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int64_t i = i0 + (int64_t) j * blockDim.x;
+                if (i < row4) v[j] = sr[i];
+            }
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int64_t i = i0 + (int64_t) j * blockDim.x;
+                if (i < row4) d[i] = v[j];
+            }
+        }
+    }
+}
+__global__ void add_tier_sums_kernel(float4* out, const float4* sums, int n_tiers, int64_t tier_stride4, int64_t w4) {
+    const int t = (int) blockIdx.y;
+    const int64_t c4 = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (c4 >= w4) return;
+    float4 a = out[(int64_t) t * w4 + c4];
+    for (int p = 0; p < n_tiers; ++p) {
+        const float4 v = __ldcg(sums + p * tier_stride4 + (int64_t) t * w4 + c4);   // P2P-written: past L1
+        a.x += v.x; a.y += v.y; a.z += v.z; a.w += v.w;
+    }
+    out[(int64_t) t * w4 + c4] = a;
+}
+}  // namespace
+
+void tier_sums(const float* rows, const int32_t* dst, const int32_t* tok, const int32_t* count, const float* weights,
+               int n_tok, int k, int64_t width, float* sums, uint32_t* done, uint32_t ring, unsigned* counter,
+               void* stream) {
+    if (n_tok < 1 || n_tok * k > 128 || (width & 3) != 0) {
+        std::fprintf(stderr, "tier_sums: %d tokens x %d, width %lld\n", n_tok, k, (long long) width);
+        std::exit(1);
+    }
+    const int64_t w4 = width / 4;
+    tier_sums_kernel<<<dim3((unsigned) ((w4 + 127) / 128), (unsigned) n_tok), 128, 0, (cudaStream_t) stream>>>(
+        (const float4*) rows, dst, tok, count, weights, k, w4, (float4*) sums, done, ring, counter);
+    check("tier_sums");
+}
+void copy_rows_from_mapped_owned(float* dst, const float* src, int64_t rows, int64_t width, const int32_t* hit_rows,
+                                 const int32_t* count, const int32_t* ids, const int32_t* owner_layer, void* stream) {
+    if (rows <= 0) return;
+    copy_rows_owned_kernel<<<(unsigned) rows, 256, 0, (cudaStream_t) stream>>>((float4*) dst, (const volatile float4*) src,
+                                                                             width / 4, hit_rows, count, ids, owner_layer);
+    check("copy_rows_from_mapped_owned");
+}
+void add_tier_sums(float* out, const float* sums, int n_tiers, int64_t tier_stride, int n_tok, int64_t width,
+                   void* stream) {
+    if (n_tiers <= 0 || n_tok <= 0) return;
+    const int64_t w4 = width / 4;
+    add_tier_sums_kernel<<<dim3((unsigned) ((w4 + 127) / 128), (unsigned) n_tok), 128, 0, (cudaStream_t) stream>>>(
+        (float4*) out, (const float4*) sums, n_tiers, tier_stride / 4, w4);
+    check("add_tier_sums");
 }
 
 }  // namespace strata::kernels

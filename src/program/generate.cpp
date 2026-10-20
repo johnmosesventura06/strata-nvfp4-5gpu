@@ -7265,26 +7265,48 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: WARNING: STRATA_DEVICE_TIERS is off: not with %s\n", why);
             } else {
                 const int dt_max_t = batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch);
+                const bool dt_sums = std::atoi(dt) == 2;   // =2: per-token sums into CUDA0 over P2P instead of the rows
                 bool dt_ok = true;
                 for (int p = 0; p < n_peers && dt_ok; ++p) dt_ok = peers[p].device_open(dt_max_t, (int) ss.k, err);
-                dt_ok = dt_ok && ver.set_device_tiers(n_peers, [&peers, n_peers](const strata::core::Verifier::DeviceTierWindow& w,
-                                                                                  std::string& e) {
+                // =2: CUDA0's copy of which tier holds each (layer, expert), refreshed when a tier's residency moved
+                auto dt_owner_ver = std::make_shared<uint64_t>(~0ull);
+                const int64_t dt_L = g.n_layers, dt_E = g.n_expert;
+                strata::core::Verifier* dt_ver = &ver;
+                dt_ok = dt_ok && ver.set_device_tiers(n_peers, [&peers, n_peers, dt_owner_ver, dt_L, dt_E, dt_ver](
+                                                                   const strata::core::Verifier::DeviceTierWindow& w,
+                                                                   std::string& e) {
+                    if (w.sum_mode) {
+                        uint64_t v = 0;
+                        for (int p = 0; p < n_peers; ++p) v += peers[p].res_version();
+                        if (v != *dt_owner_ver) {
+                            std::vector<int32_t> owner((size_t) (dt_L * dt_E), -1);
+                            for (int64_t l = 0; l < dt_L; ++l)
+                                for (int64_t x = 0; x < dt_E; ++x)
+                                    for (int p = 0; p < n_peers; ++p)
+                                        if (peers[p].has(l, x)) { owner[(size_t) (l * dt_E + x)] = p; break; }
+                            if (!dt_ver->upload_tier_owner(owner.data(), owner.size(), e)) return false;
+                            *dt_owner_ver = v;
+                        }
+                    }
                     for (int p = 0; p < n_peers; ++p) {
                         strata::core::PeerExperts::DeviceWindow dw;
                         dw.seq = w.seq; dw.x = w.x; dw.ids = w.ids; dw.rows = w.rows; dw.done = w.done[p];
                         dw.lb = w.lb; dw.le = w.le; dw.G = w.G; dw.k = w.k; dw.T = w.T;
                         for (int i = 0; i < 2; ++i) { dw.gtb[i] = w.gtb[i]; dw.gte[i] = w.gte[i]; }
+                        dw.sum_mode = w.sum_mode; dw.w = w.w; dw.sums = w.sum_mode ? w.sums[p] : nullptr;
+                        dw.main_res = w.main_res;
                         if (!peers[p].device_launch(dw, e)) return false;
                     }
                     return true;
-                }, err);
+                }, err, dt_sums);
                 if (!dt_ok) {
                     std::fprintf(stderr, "strata serve: STRATA_DEVICE_TIERS: %s%s\n", err.c_str(), vram_free_note().c_str());
                     return 1;
                 }
                 drive.d.peers_device = true;
                 std::fprintf(stderr, "strata serve: STRATA_DEVICE_TIERS: the %d tier GPUs serve the decode windows from graphs "
-                                     "of their own (they wait on the doorbell; the pool no longer launches them)\n", n_peers);
+                                     "of their own (they wait on the doorbell; the pool no longer launches them)%s\n", n_peers,
+                             dt_sums ? "; their per-token sums go to CUDA0 over P2P" : "");
             }
         }
         auto free_slot_mtp_rows = [](float* p) { if (p != nullptr) (void) cudaFree(p); };

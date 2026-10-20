@@ -98,6 +98,11 @@ public:
         int gtb[2] = {0, 0}, gte[2] = {0, 0};
         int k = 0;                       ///< routed experts a token
         int T = 0;                       ///< the window's rows (the graph key with G and the addresses)
+        // STRATA_DEVICE_TIERS=2: per-token weighted sums into the main's VRAM over P2P instead of the rows
+        bool sum_mode = false;
+        const float* w = nullptr;        ///< the main's routing weights, [rows][k] (device, read over P2P)
+        float* sums = nullptr;           ///< this tier's sums on the main, [rows][n_embd] (device, written over P2P)
+        const int32_t* main_res = nullptr;   ///< the main's residency table [n_layers * n_expert] (device, over P2P)
     };
     /// After open(): the device copies (residency table, slot offsets) and the buffers for windows of up to
     /// `max_t` rows.  `max_t * k` <= 128.
@@ -106,6 +111,10 @@ public:
     /// The window's graph on the tier's own stream (captured on its first use), after uploading the residency table
     /// if it changed since the last window.  Call right after the main's window graph is launched.
     bool device_launch(const DeviceWindow& w, std::string& err);
+
+    /// Bumped whenever the residency changes (adapt evicts, apply_pending admits): the main's copy of the tiers'
+    /// ownership (STRATA_DEVICE_TIERS=2) follows it.
+    uint64_t res_version() const { return res_version_; }
 
     int64_t resident() const { return resident_; }
     /// the last launch writes its rows into the host rows itself (the caller must not touch them)
@@ -138,6 +147,8 @@ private:
     // STRATA_DEVICE_TIERS
     bool dev_ready_ = false;
     bool res_dev_dirty_ = true;                       ///< res_ changed since the last upload
+    uint64_t res_version_ = 0;
+    unsigned* d_counter_ = nullptr;                   ///< tier_sums' last-block counter
     int dev_max_t_ = 0, dev_k_ = 0;
     long long dev_capx_ = 0;
     cudaStream_t dstream_ = nullptr;

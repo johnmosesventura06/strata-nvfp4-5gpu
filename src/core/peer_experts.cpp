@@ -316,6 +316,7 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
         pending_.emplace_back((int32_t) in, slot);
         ++swaps_;
         res_dev_dirty_ = true;                 // STRATA_DEVICE_TIERS: uploaded before the next window's graph
+        ++res_version_;
     }
     return ck(cudaEventRecord(refill_ev_, refill_), "refill event", err);
 }
@@ -330,6 +331,7 @@ void PeerExperts::apply_pending(bool wait) {
     for (const auto& [i, slot] : pending_) res_[(size_t) i] = slot;
     pending_.clear();
     res_dev_dirty_ = true;
+    ++res_version_;
 }
 
 // ---- STRATA_DEVICE_TIERS (see the header)
@@ -340,10 +342,12 @@ void PeerExperts::device_close() {
     if (dstream_) cudaStreamSynchronize(dstream_);
     for (auto& g : dgraphs_) cudaGraphExecDestroy(g.exec);
     dgraphs_.clear();
-    for (void* p : {(void*) d_res_, (void*) d_slot_off_, (void*) d_plan_, (void*) dx_, (void*) dout_, (void*) dq8_, dscratch_})
+    for (void* p : {(void*) d_res_, (void*) d_slot_off_, (void*) d_plan_, (void*) dx_, (void*) dout_, (void*) dq8_, dscratch_,
+                    (void*) d_counter_})
         if (p != nullptr) cudaFree(p);
     if (dstream_) cudaStreamDestroy(dstream_);
     d_res_ = nullptr; d_slot_off_ = nullptr; d_plan_ = nullptr; dx_ = dout_ = nullptr; dq8_ = nullptr; dscratch_ = nullptr;
+    d_counter_ = nullptr;
     dstream_ = nullptr;
     dev_ready_ = false;
 }
@@ -377,6 +381,8 @@ bool PeerExperts::device_open(int max_t, int k, std::string& err) {
         ck(cudaMalloc((void**) &dout_, (size_t) capx * H * sizeof(float)), "device result", err) &&
         ck(cudaMalloc((void**) &dq8_, (size_t) max_t * (H / 32) * 36), "device activations", err) &&
         ck(cudaMalloc(&dscratch_, strata::kernels::native_expert_scratch_bytes(capx, ff)), "device scratch", err) &&
+        ck(cudaMalloc((void**) &d_counter_, sizeof(unsigned)), "device counter", err) &&
+        ck(cudaMemset(d_counter_, 0, sizeof(unsigned)), "device counter", err) &&
         (off == nullptr || ck(cudaMalloc((void**) &d_slot_off_, (size_t) resident_ * sizeof(unsigned long long)), "slot offsets", err)) &&
         (off == nullptr || ck(cudaMemcpy(d_slot_off_, off, (size_t) resident_ * sizeof(unsigned long long), cudaMemcpyHostToDevice), "slot offsets", err)) &&
         ck(cudaMemcpy(d_res_, res_.data(), res_.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "residency", err);
@@ -391,7 +397,8 @@ bool PeerExperts::device_open(int max_t, int k, std::string& err) {
 bool PeerExperts::device_launch(const DeviceWindow& w, std::string& err) {
     if (!dev_ready_) { err = "peer experts: the device path is not open"; return false; }
     if (w.T < 1 || w.T > dev_max_t_ || w.k != dev_k_ || w.G < 1 || w.G > 2 || w.le <= w.lb ||
-        w.seq == nullptr || w.x == nullptr || w.ids == nullptr || w.rows == nullptr || w.done == nullptr) {
+        w.seq == nullptr || w.x == nullptr || w.ids == nullptr || w.rows == nullptr || w.done == nullptr ||
+        (w.sum_mode && (w.w == nullptr || w.sums == nullptr))) {
         err = "peer experts: a device window out of range";
         return false;
     }
@@ -428,11 +435,17 @@ bool PeerExperts::device_launch(const DeviceWindow& w, std::string& err) {
                     const int ne = n * w.k;
                     copy_from_mapped(dx_, w.x + (size_t) tb * H, (int64_t) n * H, s);
                     tier_plan(w.ids + (size_t) tb * w.k, ne, w.k, d_res_ + l * n_expert_, (int) n_expert_, d_base_,
-                              d_slot_off_, d_blob_, d_plan_, capx, s);
+                              d_slot_off_, d_blob_, d_plan_, capx, s,
+                              w.main_res != nullptr ? w.main_res + l * n_expert_ : nullptr);
                     quantize_q8_1_rows(dx_, n, H, dq8_, s);
                     const auto& f = lay.fmt[(size_t) l];
                     const auto L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
                     native_expert_grouped(L, ptr, start, counts, dst, tok, ne, ne, dq8_, dscratch_, dout_, s);
+                    if (w.sum_mode) {   // the sums into the main's VRAM, the done word by the kernel's last block
+                        tier_sums(dout_, dst, tok, counts + 1, w.w + (size_t) tb * w.k, n, w.k, H,
+                                  w.sums + (size_t) tb * H, w.done, ring, d_counter_, s);
+                        continue;
+                    }
                     scatter_rows_counted(dout_, w.rows + (size_t) tb * w.k * H, dst, counts + 1, ne, H, s);
                 }
                 mapped_store(w.done, ring, s);
