@@ -89,6 +89,10 @@
   "STRATA_JOURNAL_DELTA": "1"
  },
  "host": "0.0.0.0",
+ "thinking_policy": {
+  "reasoning_effort": "medium",
+  "reasoning_budget_tokens": 32768
+ },
  "port": 8190,
  "parallel": 4,
  "vision": {

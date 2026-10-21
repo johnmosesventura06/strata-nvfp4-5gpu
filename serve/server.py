@@ -56,7 +56,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
-                            tool_choice_of, unmark_think_literals)
+                            tool_choice_of, unmark_think_literals, effort_kwargs)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.winjob import contain  # noqa: E402
@@ -2702,6 +2702,7 @@ class Service:
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.restart_pending = False                     # fork: a run of token 0 (NaN logits) - fresh engine next
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
+        self.thinking_policy = None                       # the config's "thinking_policy": fixed for every request
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
@@ -3094,6 +3095,32 @@ class Service:
             except OSError as e:
                 print(f"[strata] could not save the shared settings: {e}", flush=True)
         return self.shared
+
+    def with_policy(self, req: dict, api: str) -> dict:
+        """The config's "thinking_policy" - thinking on at one effort and one budget for EVERY request, whatever it
+        asks for (applied after with_shared, so it wins over the Chat settings too).  api: "openai" (chat
+        completions), "responses" or "anthropic"; the budget is the hard cap (reasoning_budget_tokens, #123)."""
+        p = self.thinking_policy
+        if not p:
+            return req
+        req = dict(req)
+        effort, budget = p["reasoning_effort"], p["reasoning_budget_tokens"]
+        if api == "openai":
+            req["reasoning_effort"] = effort
+            req.pop("reasoning", None)
+            ctk = req.get("chat_template_kwargs")
+            if isinstance(ctk, dict):
+                req["chat_template_kwargs"] = {k: v for k, v in ctk.items() if k not in ("enable_thinking", "reasoning_effort")}
+        elif api == "responses":
+            r = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
+            req["reasoning"] = {**r, "effort": effort}
+            req.pop("reasoning_effort", None)
+        else:
+            req["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            oc = req.get("output_config") if isinstance(req.get("output_config"), dict) else {}
+            req["output_config"] = {**oc, "effort": effort}
+        req["reasoning_budget_tokens"] = budget
+        return req
 
     def with_shared(self, req: dict, api: str) -> dict:
         """The request with the shared thinking level and max tokens filled in where it has none of its own."""
@@ -5099,7 +5126,7 @@ def make_handler(svc: Service):
                 items.close()
 
         def _openai(self, req):
-            req = svc.with_shared(req, "openai")
+            req = svc.with_policy(svc.with_shared(req, "openai"), "openai")
             messages, tools, kw = openai_to_messages(req)
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
@@ -5265,6 +5292,7 @@ def make_handler(svc: Service):
                 pass
 
         def _responses_prepare(self, req):
+            req = svc.with_policy(req, "responses")
             responses_api.check_request(req)
             messages = responses_api.input_messages(req)
             tools, names, skipped = responses_api.request_tools(req)
@@ -5321,14 +5349,14 @@ def make_handler(svc: Service):
         def _count_tokens(self, req):
             """Anthropic's token count, which Claude Code asks for its context figures: the prompt this server would
             read for the same request, rendered and tokenized - the model does not run."""
-            req = svc.with_shared(req, "anthropic")
+            req = svc.with_policy(svc.with_shared(req, "anthropic"), "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             stop_strings(req)                                 # the same 400 as the request itself would get
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
 
         def _anthropic(self, req):
             svc.load()
-            req = svc.with_shared(req, "anthropic")
+            req = svc.with_policy(svc.with_shared(req, "anthropic"), "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
@@ -5980,6 +6008,23 @@ def main() -> int:
             raise SystemExit(f'[strata] config "session_auto" name {sa["name"]!r} {why}')
         svc.session_auto = sa
         svc._auto_restore()   # an engine main started never runs through ensure_loaded: take the journal back now
+    tp = cfg.get("thinking_policy")   # fixed thinking for every request (Service.with_policy)
+    if tp is not None:
+        if not isinstance(tp, dict) or set(tp) - {"reasoning_effort", "reasoning_budget_tokens"}:
+            raise SystemExit('[strata] config "thinking_policy" must be {"reasoning_effort": .., "reasoning_budget_tokens": ..}')
+        eff = tp.get("reasoning_effort", "medium")
+        try:
+            kw = effort_kwargs(eff)
+        except ValueError as e:
+            raise SystemExit(f'[strata] config "thinking_policy": {e}')
+        if kw.get("enable_thinking") is False:
+            raise SystemExit('[strata] config "thinking_policy": the effort keeps thinking on (not "none")')
+        bud = tp.get("reasoning_budget_tokens", 0)
+        if isinstance(bud, bool) or not isinstance(bud, int) or bud < 0:
+            raise SystemExit('[strata] config "thinking_policy": reasoning_budget_tokens is a whole number of tokens (0: none)')
+        svc.thinking_policy = {"reasoning_effort": eff, "reasoning_budget_tokens": bud}
+        print(f"[strata] thinking policy: every request thinks at effort {eff}, budget {bud or 'none'} tokens "
+              f"(the request's own thinking fields are overridden)", flush=True)
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
