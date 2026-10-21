@@ -56,6 +56,12 @@ namespace {
 constexpr float EPS = 1e-6f;
 
 // #783 PR-i: STRATA_MTP_CATCHUP_ALL=1 catches the drafter's K/V up for the whole verified window, rejected rows included
+// STRATA_MTP_ATTN_FAST=1: the draft layer's attention on qsa_decode_attn_batch_draft (heads split over 3 blocks, the
+// merge over the live chunks only) - drafts only, the verify window decides every token
+bool mtp_attn_fast() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_MTP_ATTN_FAST"); return v && v[0] == '1'; }();
+    return on;
+}
 bool mtp_catchup_all() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_MTP_CATCHUP_ALL");
@@ -828,7 +834,8 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         if (st_.kv_rot) fwht256_inplace_cuda(qcur_, (int64_t) T * NH, cs);
         const QsaAttnPools pools = qsa_attn_pools(st_);
         if (window_ > 0) window_ids(const_cast<int32_t*>(step), T, (int) window_, ident_, cap_, cs);
-        qsa_decode_attn_batch(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
+        if (mtp_attn_fast()) qsa_decode_attn_batch_draft(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
+        else qsa_decode_attn_batch(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
         if (st_.kv_rot) fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
         native_qsa_gate_apply(attn_, qfull_, attn32_, (int) (T * NH), (int) HD, cs);
         native_quantize_q8_1(attn32_, xq_, (int) (NH * HD), T, cs);

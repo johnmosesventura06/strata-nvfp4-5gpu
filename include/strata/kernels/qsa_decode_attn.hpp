@@ -43,4 +43,9 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
 
+/// The MTP draft layer's attention (STRATA_MTP_ATTN_FAST): the same arguments and result as qsa_decode_attn_batch
+/// to float rounding - the heads split over more blocks, the merge over the live chunks only.  Drafts only.
+void qsa_decode_attn_batch_draft(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                                 int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
+
 }  // namespace strata::kernels
