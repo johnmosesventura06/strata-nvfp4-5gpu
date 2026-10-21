@@ -58,6 +58,12 @@ from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_mess
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
                             tool_choice_of, unmark_think_literals, effort_kwargs)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
+
+# the running request's phase for /metrics' slot view: Service.run keeps it in a box on this thread, and the batch
+# engine's slot stream (a generator Service.run drives, so on the same thread) takes the box into the slot's live view
+_REQ_PHASE = threading.local()
+PARSER_PHASE = {"reasoning": "thinking", "rcall": "tool call", "call": "tool call", "json": "tool call",
+                "content": "answering"}
 from serve import runconfig  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
@@ -1302,7 +1308,7 @@ class StrataEngine:
                         self.slot_q[slot].get_nowait()
                     head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
                     live = {"slot": slot, "state": "reading", "prompt_tokens": len(prompt), "generated": 0,
-                            "started": time.time(), "first_token": None}
+                            "started": time.time(), "first_token": None, "box": getattr(_REQ_PHASE, "box", None)}
                     self.slot_live[slot] = live
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
@@ -1473,6 +1479,8 @@ class StrataEngine:
             view.append({"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
                          "generated": r["generated"], "elapsed_s": round(now - r["started"], 1),
                          "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
+            if r["state"] == "decoding" and r.get("box"):   # thinking / answering / tool call (Service.run's parser)
+                view[-1]["phase"] = r["box"].get("phase")
         return view
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
@@ -3587,6 +3595,10 @@ class Service:
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
+        phase = {"phase": "thinking" if thinking else "answering"}   # this request's, for its batch slot's view
+        _REQ_PHASE.box = phase
+        def mark_phase():
+            phase["phase"] = PARSER_PHASE.get(parser.state, "answering")
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -3685,7 +3697,7 @@ class Service:
                                     break
                                 raw_ids.append(t)
                                 seg.append(t)
-                                thinking_n += parser.state in ("reasoning", "rcall")
+                                thinking_n += parser.state in ("reasoning", "rcall"); mark_phase()
                                 run_len = run_len + 1 if t == run_tok else 1
                                 run_tok = t
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
@@ -3787,7 +3799,7 @@ class Service:
                                 for t in extra:
                                     n += 1
                                     raw_ids.append(t)
-                                    thinking_n += parser.state in ("reasoning", "rcall")
+                                    thinking_n += parser.state in ("reasoning", "rcall"); mark_phase()
                                     evs = cut(parser.feed(detok.push(t)))
                                     self._note(n, evs, st, rate)
                                     for ev in evs:
@@ -3817,7 +3829,7 @@ class Service:
                         for t in extra:
                             n += 1
                             raw_ids.append(t)
-                            thinking_n += parser.state in ("reasoning", "rcall")
+                            thinking_n += parser.state in ("reasoning", "rcall"); mark_phase()
                             evs = cut(parser.feed(detok.push(t)))
                             self._note(n, evs, st, rate)
                             for ev in evs:
