@@ -224,7 +224,11 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
 // run on gfx103x (RDNA2), with 8 cells per step and the butterfly's lane exchanges in registers (DPP / permlanex16)
 // instead of ds_bpermute: there the score loop is bound by the LDS pipe (the q reads and ds_bpermute share it), not by
 // occupancy - 8 cells per step at 7 waves/SIMD beat 1 cell at 9.  Every other card keeps exactly the kernel above.
-#if defined(STRATA_EXPERIMENTAL_SM60) || (defined(__HIPCC__) && !defined(STRATA_HIP_GFX906))
+// Fork (lab/upsync): built on every CUDA build too, for STRATA_ATTN_DAILY=1 (see daily_attn below).  With NC 2 and
+// no DPP it is the Daily's (be4cf1c) attn_chunk_kernel line for line - the same reduce12 scores, the same cell-major
+// probabilities and the same four-cell value fold - except that `spt` shares `sq`'s storage here (no arithmetic
+// change).  Without the variable nothing selects it on a card at or above sm_75.
+#if defined(STRATA_EXPERIMENTAL_SM60) || !defined(__HIPCC__) || !defined(STRATA_HIP_GFX906)
 #define STRATA_ATTN_PRE75_BUILT 1
 #endif
 #if defined(STRATA_ATTN_PRE75_BUILT)
@@ -482,6 +486,102 @@ __global__ void __launch_bounds__(HD) attn_merge_kernel(const float* __restrict_
     attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
 }
 
+// attn_merge_kernel's arithmetic in the same chunk order, with two changes that leave every output bit as it was
+// (the Daily's 3effa9d5, from Hardin22; qsa_merge_daily_parity compares the two kernels on the same partials, all four
+// KV formats):
+//
+// (1) Bounded by the width.  The chunk kernel writes m = -FLT_MAX, l = 0 for every chunk with c0 >= step[kStepWidth]
+//     (its `n_here <= 0` exit) and the merge skips exactly those, so it can stop at n_act = ceil(width / CHUNK):
+//     fmaxf with -FLT_MAX never changes M, and a skipped chunk never touches L or acc.  The drafter's merge walks its
+//     whole capacity (--mtp-window 32768: 512 chunks) at every context, where a short context fills one or two.
+// (2) Loads batched.  attn_merge_kernel loads part_l / part_acc behind its `m == -FLT_MAX` branch, so the compiler
+//     issues each chunk's l and acc loads inside that chunk's branch: a few dependent L2 round trips per chunk.  Here
+//     the m, l and acc of U chunks are loaded first, guarded only by the chunk index, then consumed in chunk order.
+//     The skip is a select on the loaded m instead of a branch, so the loads cannot move back behind it.  The values
+//     selected are the very fmaf's attn_merge_kernel computes (same operands, same order), and a skipped chunk leaves
+//     L and acc as they were, as its `continue` does.
+constexpr int kMergeU = 16;
+
+template <int U, bool TAIL>
+__device__ __forceinline__ void merge_max_block(const float* __restrict__ pm, int c0, int n_act, float& M) {
+    float mm[U];
+#pragma unroll
+    for (int u = 0; u < U; ++u) mm[u] = (!TAIL || c0 + u < n_act) ? pm[(size_t) (c0 + u) * G] : -FLT_MAX;
+#pragma unroll
+    for (int u = 0; u < U; ++u)
+        if (!TAIL || c0 + u < n_act) M = fmaxf(M, mm[u]);
+}
+
+template <int U, bool TAIL>
+__device__ __forceinline__ void merge_sum_block(const float* __restrict__ pm, const float* __restrict__ pl,
+                                                const float* __restrict__ pa, int c0, int n_act, float M, float& L,
+                                                float& acc) {
+    float mm[U], ll[U], aa[U];
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+        const bool in = !TAIL || c0 + u < n_act;
+        mm[u] = in ? pm[(size_t) (c0 + u) * G] : -FLT_MAX;
+        ll[u] = in ? pl[(size_t) (c0 + u) * G] : 0.0f;
+        aa[u] = in ? pa[(size_t) (c0 + u) * G * HD] : 0.0f;
+    }
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+        const float w = __expf(mm[u] - M);
+        const float L_next = fmaf(ll[u], w, L);
+        const float acc_next = fmaf(aa[u], w, acc);
+        const bool live = !(mm[u] == -FLT_MAX);   // attn_merge_kernel: `if (m == -FLT_MAX) continue;`
+        L = live ? L_next : L;
+        acc = live ? acc_next : acc;
+    }
+}
+
+template <int U>
+__global__ void __launch_bounds__(HD) attn_merge_v2_kernel(const float* __restrict__ part_acc,
+                                                           const float* __restrict__ part_m,
+                                                           const float* __restrict__ part_l, int n_chunks,
+                                                           const int32_t* __restrict__ steps,
+                                                           float* __restrict__ attn, long long scratch_stride = 0) {
+    part_acc += (size_t) blockIdx.y * (size_t) scratch_stride;
+    part_m += (size_t) blockIdx.y * (size_t) scratch_stride;
+    part_l += (size_t) blockIdx.y * (size_t) scratch_stride;
+    attn += (size_t) blockIdx.y * (size_t) gridDim.x * HD;
+    // the step record the chunk kernel read for this query (attn_chunk_kernel: step + blockIdx.z * kStepCount)
+    const int width = __ldg(steps + (size_t) blockIdx.y * kStepCount + kStepWidth);
+    const int n_act = width > 0 ? min(n_chunks, (width - 1) / CHUNK + 1) : 0;
+    const int h = blockIdx.x;                 // global query head
+    const int kvh = h / G, hl = h % G;
+    const int d = threadIdx.x;
+    // chunk c of this head: part_m / part_l [(kvh * n_chunks + c) * G + hl], part_acc [that * HD + d]
+    const size_t base = (size_t) kvh * (size_t) n_chunks * G + (size_t) hl;
+    const float* pm = part_m + base;
+    const float* pl = part_l + base;
+    const float* pa = part_acc + base * HD + (size_t) d;
+    const int n_full = n_act - n_act % U;
+    float M = -FLT_MAX;
+    for (int c0 = 0; c0 < n_full; c0 += U) merge_max_block<U, false>(pm, c0, n_act, M);
+    if (n_full < n_act) merge_max_block<U, true>(pm, n_full, n_act, M);
+    float L = 0.0f, acc = 0.0f;
+    for (int c0 = 0; c0 < n_full; c0 += U) merge_sum_block<U, false>(pm, pl, pa, c0, n_act, M, L, acc);
+    if (n_full < n_act) merge_sum_block<U, true>(pm, pl, pa, n_full, n_act, M, L, acc);
+    attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
+}
+
+// Fork (lab/upsync, port of upstream 731528be): STRATA_ATTN_DAILY=1 runs the Daily's (be4cf1c) decode attention on
+// every CUDA card: the chunk pass on PR #540's kernel (attn_chunk_kernel_pre75<M, 2, false>, the Daily's
+// attn_chunk_kernel), bit for bit the default kernel's partials, and the merge on attn_merge_v2_kernel (bitwise the
+// same output).  Unset or anything but "1" keeps the old kernels; STRATA_ATTN_PRE75=0 still turns the chunk kernel off.
+[[maybe_unused]] bool daily_attn() {
+#if defined(__HIPCC__)
+    return false;
+#else
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_ATTN_DAILY");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+#endif
+}
+
 #if defined(STRATA_ATTN_PRE75_BUILT)
 // CUDA: the current device is below sm_75; HIP: it is gfx103x (per device: a layer split can mix cards).
 // STRATA_ATTN_PRE75=0 turns PR #540's kernel off (A/B); on HIP =1 also runs it on another wave32 card.
@@ -490,9 +590,15 @@ bool pre75_attn() {
         const char* e = std::getenv("STRATA_ATTN_PRE75");
         return e == nullptr ? -1 : e[0] == '0' ? 0 : e[0] == '1' ? 1 : -1;
     }();
+    if (env == 0) return false;
+#if !defined(__HIPCC__) && !defined(STRATA_EXPERIMENTAL_SM60)
+    return daily_attn();   // the ready-made engine: attn_chunk_kernel unless STRATA_ATTN_DAILY=1
+#else
+#if !defined(__HIPCC__)
+    if (daily_attn()) return true;
+#endif
     static int cc[64] = {};
     int dev = 0;
-    if (env == 0) return false;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
 #if defined(__HIPCC__)
     if (cc[dev] == 0) {   // 2: gfx103x, 1: another card
@@ -513,6 +619,7 @@ bool pre75_attn() {
     }
     return cc[dev] < 75;
 #endif
+#endif  // ready-made CUDA engine
 }
 #if defined(__HIPCC__)
 #define STRATA_ATTN_CHUNK(M) (pre75_attn() ? attn_chunk_kernel_pre75<M, 8, true> : attn_chunk_kernel<M>)
@@ -522,6 +629,18 @@ bool pre75_attn() {
 #else
 #define STRATA_ATTN_CHUNK(M) attn_chunk_kernel<M>
 #endif
+
+// STRATA_ATTN_MERGE_V2: 1 merges with attn_merge_v2_kernel, 0 with attn_merge_kernel.  Unset it follows
+// STRATA_ATTN_DAILY, so the old merger stays the default.
+int attn_merge_v2() {
+    static const int on = [] {
+        int r = daily_attn() ? 1 : 0;
+        const char* v = std::getenv("STRATA_ATTN_MERGE_V2");
+        if (v != nullptr && *v != '\0') r = std::atoi(v) != 0 ? 1 : 0;
+        return r;
+    }();
+    return on;
+}
 
 
 // ---- the MTP draft layer's attention (qsa_decode_attn_batch_draft): its numerics only steer the drafts - the verify
@@ -756,8 +875,12 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     else
         STRATA_ATTN_CHUNK(0)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
-    attn_merge_kernel<<<dim3((unsigned) s.n_head, (unsigned) n_q), HD, 0, st>>>(part_acc, part_m, part_l, n_chunks,
-                                                                                  attn, stride);
+    if (attn_merge_v2())
+        attn_merge_v2_kernel<kMergeU><<<dim3((unsigned) s.n_head, (unsigned) n_q), HD, 0, st>>>(part_acc, part_m, part_l,
+                                                                                               n_chunks, steps, attn, stride);
+    else
+        attn_merge_kernel<<<dim3((unsigned) s.n_head, (unsigned) n_q), HD, 0, st>>>(part_acc, part_m, part_l, n_chunks,
+                                                                                      attn, stride);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_decode_attn_batch: %s\n", cudaGetErrorString(e));
@@ -804,7 +927,10 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     else
         STRATA_ATTN_CHUNK(0)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks, 0, 0);
-    attn_merge_kernel<<<(unsigned) s.n_head, HD, 0, st>>>(part_acc, part_m, part_l, n_chunks, attn);
+    if (attn_merge_v2())
+        attn_merge_v2_kernel<kMergeU><<<(unsigned) s.n_head, HD, 0, st>>>(part_acc, part_m, part_l, n_chunks, step, attn);
+    else
+        attn_merge_kernel<<<(unsigned) s.n_head, HD, 0, st>>>(part_acc, part_m, part_l, n_chunks, attn);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_decode_attn: %s\n", cudaGetErrorString(e));
