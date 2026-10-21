@@ -86,7 +86,12 @@
   "STRATA_GR_V6": "5",
   "STRATA_MMA_Q8": "1",
   "STRATA_MTP_ATTN_FAST": "1",
-  "STRATA_JOURNAL_DELTA": "1"
+  "STRATA_JOURNAL_DELTA": "1",
+  "STRATA_QSA_ROWS": "1",
+  "STRATA_GU_SWIGLU": "1",
+  "STRATA_ATTN_DAILY": "1",
+  "STRATA_HC_UPMIX": "1",
+  "STRATA_SIDE_MIXER": "2"
  },
  "host": "0.0.0.0",
  "thinking_policy": {

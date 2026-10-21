@@ -40,6 +40,9 @@ consumer PCIe. Upstream is mostly single-GPU, AMD/Intel/Mac, and GGUF i-quants, 
 | F | `1a2f95c3` | split tensor-core decode attention (also hooked on our batch path; not on the MTP draft) | `STRATA_QSA_SPLIT_ATTN=1` | rounding-level; no gain measured, not used |
 | G | docs `703e63c1` (no upstream code) | NVFP4 prompt down products on two FP4 terms (5060 Ti tiers) | `STRATA_PREFILL_X2_MIN_K=640` | rounding-level, closer to FP16 per upstream |
 
+**Promoted to production 2026-10-22: A–E + `STRATA_HC_UPMIX=1`** (owner: "let's include hc_upmix so we're closer to
+upstream ... let's promote all of it to production please"). F and G stay off (G: owner's call; F: no gain).
+
 Measured on this rig with A–E (2026-10-22, one boot each, vs production `24a57eaf`): decode 1 / 3 / 4 streams
 128.4 / 161.4 / 169.8 → 143.7 / 179.1 / 188.0 tok/s (+11–12%); batch window 28.8 → 25.0 ms.
 
@@ -48,7 +51,8 @@ Measured on this rig with A–E (2026-10-22, one boot each, vs production `24a57
 - serg `78855ec0` / `53001550` / `87e0faea`: fused prompt experts read in place (−6% at 32K).
 - INT8 tensor-core prompt attention (`STRATA_PROMPT_ATTN_IMMA`): already the default.
 - `STRATA_HC_UPMIX`: present. It defaults on only for sm_120, and the trunk is sm_86. Upstream measured +0.4–0.6%
-  prompt on sm_86, bit-exact. Candidate switch, not a port.
+  prompt on sm_86, bit-exact. Measured here: texts identical, prompt read no change (9.03/8.96 vs 9.33/8.98 s); turned on
+  anyway to stay closer to upstream (2026-10-22).
 - `STRATA_ROUTE_RESIDENT`, `STRATA_PF_FUSED` (i-quant formats only), `--pipeline-windows`: present or not applicable.
 
 ## Reviewed 2026-10-22: deliberately not taken
