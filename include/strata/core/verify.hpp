@@ -67,6 +67,9 @@ inline bool batch_concurrent_env() {
 
 class Verifier {
 public:
+    /// Free the graph pair of the least recently used batch layout (true: one was freed) - the MTP drafter's VRAM
+    /// relief when its own graph finds no room
+    bool free_lru_batch_graph();
     Verifier() = default;
     ~Verifier();
     Verifier(const Verifier&) = delete;

@@ -1016,6 +1016,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
 }
 
 namespace {
+std::function<bool()> g_vram_relief;
 bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char* what, std::string& err) {
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs, &graph);
@@ -1023,9 +1024,21 @@ bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char*
         if (graph) cudaGraphDestroy(graph);
         return false;
     }
-    if (ce != cudaSuccess || cudaGraphInstantiate(&exec, graph, 0) != cudaSuccess) {
+    cudaError_t ie = ce == cudaSuccess ? cudaGraphInstantiate(&exec, graph, 0) : ce;
+    // out of VRAM (the verifier's batch layouts hold it): free them one at a time, LRU first, as the verifier's own
+    // window graphs do (#997), instead of ending the engine; they are captured again when needed
+    int freed = 0;
+    while (ie == cudaErrorMemoryAllocation && g_vram_relief) {
+        (void) cudaGetLastError();
+        if (!g_vram_relief()) break;
+        ++freed;
+        ie = cudaGraphInstantiate(&exec, graph, 0);
+    }
+    if (freed > 0)
+        std::fprintf(stderr, "strata mtp: no VRAM for the %s graph: freed %d batch window layouts\n", what, freed);
+    if (ie != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
-        err = std::string("mtp: ") + what + " capture: " + cudaGetErrorString(ce);
+        err = std::string("mtp: ") + what + " capture: " + cudaGetErrorString(ie);
         return false;
     }
     cudaGraphDestroy(graph);
@@ -1035,6 +1048,8 @@ bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char*
     return true;
 }
 }  // namespace
+
+void MtpDrafter::set_vram_relief(std::function<bool()> f) { g_vram_relief = std::move(f); }
 
 bool MtpDrafter::capture_prefill(int T, std::string& err) {
     if (prefill_exec_[T]) return true;

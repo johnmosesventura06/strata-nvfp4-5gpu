@@ -26,6 +26,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -61,6 +62,9 @@ public:
     void set_draft_vocab(const std::string& path) { dvocab_path_ = path; }
     /// STRATA_MTP_TOP2=1 (diagnostic): draft j's runner-up token in the last draft() (-1 = unknown)
     static bool top2_env();
+    /// --serve: called when a draft graph finds no VRAM to instantiate - frees one cached graph elsewhere (the
+    /// verifier's least recently used batch layout) and says whether it did; the capture then retries
+    static void set_vram_relief(std::function<bool()> f);
     int32_t top2(int j) const { return j >= 0 && j < (int) top2_.size() ? top2_[(size_t) j] : -1; }
     int max_t() const { return max_t_; }
     uint64_t vram_bytes() const { return vram_; }

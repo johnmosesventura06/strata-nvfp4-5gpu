@@ -7102,6 +7102,9 @@ int main(int argc, char** argv) {
             return 1;
         }
         strata::core::Verifier ver;
+        // the MTP drafters' graphs, short of VRAM, free the verifier's LRU batch layouts (as its own window graphs do)
+        strata::core::MtpDrafter::set_vram_relief([&ver] { return ver.free_lru_batch_graph(); });
+        struct ReliefOff { ~ReliefOff() { strata::core::MtpDrafter::set_vram_relief(nullptr); } } relief_off;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
@@ -12949,6 +12952,9 @@ int main(int argc, char** argv) {
         }
         mem_mark("the head and the prompt path");
         strata::core::Verifier ver;
+        // the MTP drafters' graphs, short of VRAM, free the verifier's LRU batch layouts (as its own window graphs do)
+        strata::core::MtpDrafter::set_vram_relief([&ver] { return ver.free_lru_batch_graph(); });
+        struct ReliefOff { ~ReliefOff() { strata::core::MtpDrafter::set_vram_relief(nullptr); } } relief_off;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
