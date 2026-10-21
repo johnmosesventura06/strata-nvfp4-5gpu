@@ -293,6 +293,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   $("state-label").textContent = label;
   $("state-detail").textContent = detail;
   $("state-bar").style.width = `${pct}%`;
+  renderSlots(live);
 
   // the eight cards
   const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
@@ -1133,3 +1134,56 @@ if (startQuestion) history.replaceState(null, "", location.pathname + location.h
 loadHealth().then(loadMcp).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
 showTab(location.hash.slice(1) || "chat");
 poll();
+
+// the batch slots (/metrics live.slots): each one's state - reading, thinking / answering / calling a tool (the
+// server's per-slot phase when it reports one, else "Generating"), idle - and its own decode speed
+function renderSlots(live) {
+  const card = $("slots-card"), box = $("slots");
+  if (!card || !box) return;
+  const slots = (live && Array.isArray(live.slots)) ? live.slots : [];
+  card.hidden = slots.length === 0;
+  if (!slots.length) return;
+  const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+  let gen = 0, reading = 0, idle = 0, total = 0;
+  box.innerHTML = slots.map((s) => {
+    let badge = "Idle", cls = "", main = "–", unit = "", pct = null;
+    const lines = [];
+    if (s.state === "reading") {
+      reading++;
+      badge = "Reading"; cls = "st-badge--reading";
+      // the prompt being read now is this slot's when the totals agree (one prompt is read at a time)
+      const mine = live.state === "reading" && live.prompt_total && s.prompt_tokens === live.prompt_total;
+      if (mine) {
+        pct = Math.min(100, (100 * live.prompt_read) / live.prompt_total);
+        main = fmt(pct); unit = "% read";
+        lines.push(`${fmt(live.prompt_read)} / ${fmt(live.prompt_total)} tokens`);
+      } else {
+        lines.push(`${fmt(s.prompt_tokens)} prompt tokens`);
+      }
+      if (s.elapsed_s != null) lines.push(`${fmt(s.elapsed_s, 1)} s`);
+    } else if (s.state === "decoding") {
+      gen++;
+      const ph = typeof s.phase === "string" && s.phase ? s.phase : null;
+      badge = ph ? ph[0].toUpperCase() + ph.slice(1) : "Generating";
+      cls = ph === "tool call" ? "st-badge--queued" : "st-badge--generating";
+      if (s.tok_s != null) { main = fmt(s.tok_s, 1); unit = "tok/s"; total += s.tok_s; }
+      lines.push(`${fmt(s.generated)} tokens generated`);
+      if (s.prompt_tokens != null) lines.push(`${fmt(s.prompt_tokens)} tokens of context`);
+      if (s.elapsed_s != null) lines.push(`${fmt(s.elapsed_s, 1)} s`);
+    } else {
+      idle++;
+      lines.push(s.held_tokens ? `holds ${fmt(s.held_tokens)} tokens for its next turn` : "empty");
+    }
+    return `<div class="slot" data-state="${esc(s.state)}">` +
+      `<div class="slot__head"><b>Slot ${esc(s.slot)}</b><span class="st-badge ${cls}">${esc(badge)}</span></div>` +
+      `<div class="slot__speed">${esc(main)}<small>${esc(unit)}</small></div>` +
+      (pct != null ? `<div class="st-progress" data-tone="info"><div class="st-progress__bar" style="width:${pct}%"></div></div>` : "") +
+      lines.map((l) => `<div class="muted small">${esc(l)}</div>`).join("") + `</div>`;
+  }).join("");
+  const outside = live.outside_slots || 0, waiting = live.waiting || 0;
+  const parts = [gen && `${gen} generating`, reading && `${reading} reading`, idle && `${idle} idle`,
+                 waiting && `${waiting} waiting for a slot`,
+                 outside > waiting && `${outside - waiting} running outside the slots`].filter(Boolean);
+  if (gen) parts.push(`combined ${fmt(total, 1)} tok/s`);
+  $("slots-sum").textContent = parts.join(" · ");
+}
