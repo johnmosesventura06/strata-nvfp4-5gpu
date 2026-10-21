@@ -22,6 +22,13 @@ offers the same steps as tools.
 - Keep the docs' style: plain words, measured numbers with what they were measured on, no claims without a
   measurement.
 
+## Checking upstream for new speed-ups (this fork)
+
+This five-GPU fork shares no git history with upstream (Niko1221/Strata, sergqwer/strata-nvfp4). Before reviewing
+upstream, read **[docs/UPSTREAM-SYNC.md](docs/UPSTREAM-SYNC.md)**: it records the last upstream commits already
+reviewed, what was ported, what this fork already had and what was declined. Review only upstream commits newer than
+that marker, then update the marker.
+
 ## Contributing a change or report
 
 - Search the open issues and pull requests first, and add to a thread that already covers your point.
