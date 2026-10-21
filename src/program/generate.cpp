@@ -7902,6 +7902,10 @@ int main(int argc, char** argv) {
             }
             if (conversations.enabled())
             for (auto& [mt, path] : fs) {
+                // newest first, and only while they fit: put() makes room by evicting the OLDEST entry, which here is
+                // the newest file read - reading on past a full cache read the whole journal (99.6 GiB, 47 s at boot)
+                // and left the oldest conversations in RAM
+                if (conversations.size() >= conversations.slots()) break;
                 strata::core::SavedConversation img;
                 size_t bytes_read = 0;
                 std::string rerr;
@@ -7911,6 +7915,7 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 rb += bytes_read;
+                if (conversations.bytes() + img.bytes() > (size_t) o.conversation_cache_mib * 1024 * 1024) { ++kept; break; }
                 if (conversations.put(std::move(img))) ++ok;
                 else ++kept;                          // RAM cache full: the file stays, a later park may free room
             }
