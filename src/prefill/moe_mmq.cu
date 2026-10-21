@@ -225,7 +225,13 @@ void quantize_nvfp4_x2_scatter(const float* x, const int32_t* slot, void* xq, fl
                                int64_t tokens, int k_used, int64_t padded, cudaStream_t s);
 // w4a4x2: the products whose K is at least this take two FP4 terms (gate/up, K 2560); below it w4a8 (down, K 640:
 // two FP4 passes there, 0.206 ms, lose to w4a8's 0.185 at 32K - mmq_expert_bench)
-constexpr int64_t kX2MinK = 2048;
+// STRATA_PREFILL_X2_MIN_K=640 takes the down products (K 640) on two FP4 terms too: upstream's RTX 5070 measurement
+// (docs/NVFP4.md, 703e63c1) 1.13 -> 0.995 ms a 16-expert launch, first-token KL 0.0056 -> 0.0044 against FP16; rounding-level.
+inline int64_t x2_min_k() {
+    static const int64_t k = [] { const char* v = std::getenv("STRATA_PREFILL_X2_MIN_K"); const long long x = v ? std::atoll(v) : 0; return x > 0 ? (int64_t) x : (int64_t) 2048; }();
+    return k;
+}
+#define kX2MinK (x2_min_k())
 bool x2_mode();
 
 bool built() { return true; }
