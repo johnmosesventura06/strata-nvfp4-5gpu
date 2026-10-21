@@ -7,7 +7,55 @@ cards, the output head split across all of them, tier prefill, NVMe session jour
 support. Measured on a 4× RTX 5060 Ti 16 GB rig and a mixed RTX 3090 + 3× 5060 Ti rig (9950X, 128 GB DDR5-5000,
 driver 615.71.09 with the consumer-P2P patch, CUDA 13.3, Linux).
 
-## What's new (21 October 2026): the fifth GPU - every expert on a GPU, 4 slots, the RAM copy gone
+## What's new (22 October 2026): faster decode on the same five GPUs
+
+Same rig and config of record as the 21 October edition below (RTX 3090 trunk + 4× RTX 5060 Ti tiers, 4 slots,
+every expert on a GPU). Three rounds of decode work, each measured against the production build it replaced:
+
+| decode, total tok/s | 1 stream | 3 streams | 4 streams |
+|---|---|---|---|
+| 21 October edition | ~124 | 150.3 | 153.6 |
+| + 3090 kernels (K-split hyper-connection read, tensor-core Q8_0) | ~124 | 161.7 | 170.6 |
+| + upstream decode ports (this release; one boot, live production 141.7 / 172.6 / 182.4) | **143.7** | **179.1** | **188.0** |
+
+(The upstream ports were measured against that day's production build: 128.4 / 161.4 / 169.8 → 143.7 / 179.1 /
+188.0, decode window 28.8 → 25.0 ms. The 16K-token prompt read is unchanged, 8.8-9.1 s.)
+
+**1. The 3090's decode kernels** (`STRATA_GR_V6=5`, `STRATA_MMA_Q8=1`). The hyper-connection read splits each row's K
+five ways, and the dense Q8_0 matvecs run on int8 tensor cores (`mma`), with the same kernel for every window width,
+so a batch row never depends on its neighbours. 4 streams +10.8%, 16K prompt 9.01 → 8.82 s.
+
+**2. The MTP draft head's attention** (`STRATA_MTP_ATTN_FAST=1`). The draft layer's attention splits its heads over
+three blocks and merges only the chunks that hold cells: 1.88 → 1.55 ms a window (~+2% decode). Only the drafts use
+it, so the verified tokens are unchanged.
+
+**3. Upstream's decode kernels, ported** (see [docs/UPSTREAM-SYNC.md](docs/UPSTREAM-SYNC.md) for every commit
+reviewed, ported or declined):
+- NVFP4 experts decode each weight once per window (`Split<40>`), and the down rows run on 8 lanes. Always on, on
+  the trunk and in the tiers' decode graphs. This is most of the gain. Outputs differ from the previous build at
+  rounding level only.
+- `STRATA_QSA_ROWS`, `STRATA_GU_SWIGLU`, `STRATA_ATTN_DAILY`, `STRATA_SIDE_MIXER=2`, `STRATA_HC_UPMIX`: upstream's
+  bitwise sm_86 / sm_120 decode switches, on in the config of record.
+- Built but off: `STRATA_QSA_SPLIT_ATTN` (no gain here) and `STRATA_PREFILL_X2_MIN_K=640` (FP4 prompt down
+  products on the tiers: +1.4% prompt time here).
+
+**4. The conversation journal writes deltas** (`STRATA_JOURNAL_DELTA=1`). A parked turn writes only the 1 MiB chunks
+that changed against the deepest earlier file of the same conversation. A `.map` sidecar records every chunk's hash,
+every chunk is verified at mount, and chains are at most four files deep. Real parks went 601 → 137 MiB and
+1,046 → 208 MiB, and the rebuilt state is byte-identical (a tampered parent is refused). Parked conversations also stay
+in RAM now (`--conversation-cache-mib 16384 --conversation-cache-slots 16`), and the boot warm-up stops once that
+cache is full.
+
+**5. The server.**
+- `"thinking_policy"` in the run config gives every request one thinking setting, overriding the client on both the
+  OpenAI and the Anthropic API. The config of record uses thinking on, effort medium, budget 32,768.
+- The Monitor has a **Slots** card: each batch slot's state (reading / thinking / answering / tool call / idle) and
+  its own speed. `/metrics` reports the same per slot.
+
+**Tried and parked:** batched MTP drafts across slots (the 3090 has no VRAM left for their graphs), and reading two
+chunks of one prompt at once (`pf-pair` branch: the two paths deadlock in a first-use probe).
+
+## Earlier (21 October 2026): the fifth GPU - every expert on a GPU, 4 slots, the RAM copy gone
 
 The production rig is now an **RTX 3090 trunk + 4× RTX 5060 Ti tiers** (each tier on a CPU-attached Gen5 x4 link;
 9950X, 128 GB DDR5-5000). The fourth tier made room for every expert of the model on a GPU, and the work below turns
@@ -216,9 +264,17 @@ still runs, falling back to host-mapped transport (correct, slower).
 | `STRATA_PF_TIER_X16` | unset (on) | activations go out once in FP16 through host memory (`0`: one P2P copy per tier) |
 | `STRATA_CONV_POOL_MIB` | `4096` | fixed RAM pool (MiB) for parked/mounted conversation images; beyond it images are mapped and returned on free (`0`: no pool) |
 | `STRATA_PREFILL_TIMING` | unset | `1`: per-phase GPU timeline of each prompt read, trunk and first tier |
+| `STRATA_GR_V6` | `5` | the hyper-connection read with each row's K split 5 ways (3090) |
+| `STRATA_MMA_Q8` | `1` | dense Q8_0 decode matvecs on int8 tensor cores, one kernel for every window width |
+| `STRATA_MTP_ATTN_FAST` | `1` | the MTP draft layer's attention split over blocks (drafts only) |
+| `STRATA_JOURNAL_DELTA` | `1` | journal parks write only changed 1 MiB chunks against the conversation's deepest earlier file |
+| `STRATA_QSA_ROWS` / `STRATA_GU_SWIGLU` / `STRATA_ATTN_DAILY` / `STRATA_HC_UPMIX` | `1` | upstream's bitwise decode / prompt kernels (docs/UPSTREAM-SYNC.md) |
+| `STRATA_SIDE_MIXER` | `2` | single-stream windows: the mixer's input-only work on graph branches |
+| `STRATA_QSA_SPLIT_ATTN` / `STRATA_PREFILL_X2_MIN_K` | unset | built, off: split tensor-core decode attention; FP4 prompt down products |
 
 ## Docs
 
+- [docs/UPSTREAM-SYNC.md](docs/UPSTREAM-SYNC.md) — upstream review marker: the last upstream commits reviewed, what was ported, what was declined
 - [docs/HEAD-SPLIT-PORT.md](docs/HEAD-SPLIT-PORT.md) — the head-split port ledger: design, verification
   harness, the record corrections (the early "+8.2%" headline was retracted after bracketed A/Bs; pooled
   gain is +2-4%, state-dependent), the RAM-claim drift mechanism, and the PLE repack retraction.
