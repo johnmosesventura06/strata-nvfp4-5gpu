@@ -1230,6 +1230,56 @@ __device__ __forceinline__ void row_dot_80_sub16(const uint8_t* row, const block
     }
 }
 
+// 147-verify: row_dot_80_sub16 for two rows (a gate row and its up row) at once, both rows' weight loads of a step issued
+// before either is applied; each row's sums are row_dot_80_sub16's, in its order (the same bits).
+template<int TY, int NC, bool EXACT_N = false, bool STAGE_GRID = false>
+__device__ __forceinline__ void row_dot2_80_sub16(const uint8_t* ra, const uint8_t* rb, const block_q8_1* x, const int (&off)[NC],
+                                                  int n, int t, float (&sa)[NC], float (&sb)[NC],
+                                                  const uint32_t* __restrict__ s_grid = nullptr) {
+    using F = Fmt<TY>;
+    using S = Split<TY>;
+#pragma unroll
+    for (int c = 0; c < NC; ++c) { sa[c] = 0.0f; sb[c] = 0.0f; }
+    for (int k = t; k < 80; k += 32) {
+        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        const typename S::W wa = S::template load<STAGE_GRID>(ra, kbx, iqs, s_grid);
+        const typename S::W wb = S::template load<STAGE_GRID>(rb, kbx, iqs, s_grid);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (EXACT_N || c < n) {
+                sa[c] += S::apply(wa, x + off[c] + kbx * (F::qk / 32), iqs);
+                sb[c] += S::apply(wb, x + off[c] + kbx * (F::qk / 32), iqs);
+            }
+    }
+    float a16[NC], b16[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) { a16[c] = 0.0f; b16[c] = 0.0f; }
+    for (int k = t + 16; k < 64; k += 32) {
+        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        const typename S::W wa = S::template load<STAGE_GRID>(ra, kbx, iqs, s_grid);
+        const typename S::W wb = S::template load<STAGE_GRID>(rb, kbx, iqs, s_grid);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (EXACT_N || c < n) {
+                a16[c] += S::apply(wa, x + off[c] + kbx * (F::qk / 32), iqs);
+                b16[c] += S::apply(wb, x + off[c] + kbx * (F::qk / 32), iqs);
+            }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        if (EXACT_N || c < n) {
+            sa[c] = __fadd_rn(sa[c], a16[c]);
+            sb[c] = __fadd_rn(sb[c], b16[c]);
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) {
+                sa[c] += __shfl_xor_sync(0xffffffffu, sa[c], o);
+                sb[c] += __shfl_xor_sync(0xffffffffu, sb[c], o);
+            }
+        }
+    }
+}
+
+
 template<int TY, bool STAGE_GRID = kStageIqGrid<TY>>
 __device__ __forceinline__ const uint32_t* stage_iq_grid(uint32_t* s_buf, int tid, int nthreads) {
     if constexpr (!STAGE_GRID) {
@@ -1701,6 +1751,83 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_kernel(const float* _
         q8_1_store(h, hq, i);
     }
 }
+
+// 147-verify (STRATA_GU_SWIGLU=1): native_gu_multi_kernel's 16-lane gate and up rows, SwiGLU and the q8_1 blocks in ONE
+// launch.  A block owns 32 consecutive hidden columns r of a group: its 32 sub-warps each compute gate row r and up row
+// r (the same row_dot_80_sub16 calls, entries GRP_NC at a time, the same NVFP4 tail scale), so the product
+// h = silu(gate) * up is formed in the block and warp k quantizes entry k's 32 values with q8_1_store - the q8_1 block
+// of those columns.  Every value is the separate kernels': the dots are the same calls, gate and up are the same floats
+// (written to memory before), the product is rounded on its own as in swiglu_q8_1_entries_kernel, and q8_1_store is the
+// same.  It saves the gate/up round trip through memory and one launch per layer.
+template<int TG, bool STAGE_GRID>
+__global__ void __launch_bounds__(512) native_gu_swiglu_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                               const int32_t* __restrict__ grp_start,
+                                                               const int32_t* __restrict__ n_groups,
+                                                               const int32_t* __restrict__ ent_tok,
+                                                               const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+                                                               block_q8_1* __restrict__ hq) {
+#if defined(__HIPCC__)
+#pragma clang fp contract(off)
+#endif
+    const int ng = *n_groups;
+    if ((int) blockIdx.y >= ng) return;
+    STRATA_SHARED_ALIGN16_U32(s_grid_buf, IqGridWords<TG, STAGE_GRID>::value);
+    const uint32_t* s_grid = stage_iq_grid<TG, STAGE_GRID>(s_grid_buf, threadIdx.x, 512);
+    __shared__ float sh[GRP_NC][32];
+    const int sw = threadIdx.x >> 4, t = threadIdx.x & 15, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r = blockIdx.x * 32 + sw;                       // the hidden column (gate row r, up row r)
+    const size_t g_off = (size_t) r * L.gu_row, u_off = L.up_off + (size_t) r * L.gu_row;
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+        const float sg = L.tail_off ? ((const float*) (blob + L.tail_off))[0] : 1.0f;   // NVFP4: s_gate / s_up
+        const float su = L.tail_off ? ((const float*) (blob + L.tail_off))[1] : 1.0f;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; e += GRP_NC) {
+            const int n = min(GRP_NC, e1 - e);
+            float gv[GRP_NC], uv[GRP_NC];
+            if (n == 1) {
+                const int off1[1] = { ent_tok[e] * 80 };
+                float a1[1], b1[1];
+                row_dot2_80_sub16<TG, 1, true, STAGE_GRID>(blob + g_off, blob + u_off, xq, off1, 1, t, a1, b1, s_grid);
+                gv[0] = a1[0]; uv[0] = b1[0];
+            } else if (n == 2) {
+                const int off2[2] = { ent_tok[e] * 80, ent_tok[e + 1] * 80 };
+                float a2[2], b2[2];
+                row_dot2_80_sub16<TG, 2, true, STAGE_GRID>(blob + g_off, blob + u_off, xq, off2, 2, t, a2, b2, s_grid);
+#pragma unroll
+                for (int c = 0; c < 2; ++c) { gv[c] = a2[c]; uv[c] = b2[c]; }
+            } else if (n == 3) {
+                const int off3[3] = { ent_tok[e] * 80, ent_tok[e + 1] * 80, ent_tok[e + 2] * 80 };
+                float a3[3], b3[3];
+                row_dot2_80_sub16<TG, 3, true, STAGE_GRID>(blob + g_off, blob + u_off, xq, off3, 3, t, a3, b3, s_grid);
+#pragma unroll
+                for (int c = 0; c < 3; ++c) { gv[c] = a3[c]; uv[c] = b3[c]; }
+            } else {
+                const int off4[4] = { ent_tok[e] * 80, ent_tok[e + 1] * 80, ent_tok[e + 2] * 80, ent_tok[e + 3] * 80 };
+                float a4[4], b4[4];
+                row_dot2_80_sub16<TG, 4, true, STAGE_GRID>(blob + g_off, blob + u_off, xq, off4, 4, t, a4, b4, s_grid);
+#pragma unroll
+                for (int c = 0; c < 4; ++c) { gv[c] = a4[c]; uv[c] = b4[c]; }
+            }
+            // sub-lane c holds entry c's sums (as the separate kernel's store): h of column r, entry c
+#pragma unroll
+            for (int c = 0; c < GRP_NC; ++c) {
+                if (c < n && t == c) {
+                    const float gg = gv[c] * sg, uu = uv[c] * su;
+#if defined(__HIPCC__)
+                    sh[c][sw] = (gg / (1.0f + __expf(-gg))) * uu;
+#else
+                    sh[c][sw] = __fmul_rn(gg / (1.0f + __expf(-gg)), uu);
+#endif
+                }
+            }
+            __syncthreads();
+            if (warp < n) q8_1_store(sh[warp][lane], hq, (long long) (e + warp) * L.n_ff + (long long) blockIdx.x * 32 + lane);
+            __syncthreads();
+        }
+    }
+}
+
 
 // ---------------------------------------------------------------- dequant (dequantize.cuh)
 template<typename dst_t> __device__ __forceinline__ dst_t cvt(float v);
@@ -2853,6 +2980,36 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
     }
 }
 
+// 147-verify: STRATA_GU_SWIGLU=1 runs gate/up, SwiGLU and the q8_1 blocks as native_gu_swiglu_kernel, where launch_gu would
+// run native_gu_multi_kernel's 16-lane path (n_embd 2560, the split formats); bitwise the same hq.  Upstream (75afe3f4)
+// defaults it on for 12.0 cards (RTX PRO 5000: decode +0.5-0.9%, the same tokens) and its sm_86 set; this port: opt-in.
+bool gu_swiglu_on() {
+    // port: the switch alone (STRATA_GU_SWIGLU=1 on, unset / 0 off) on every card - the 3090 trunk and the 12.0 tiers
+    static const bool on = [] { const char* v = std::getenv("STRATA_GU_SWIGLU"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+template<int TG>
+bool launch_gu_swiglu(const NativeExpertLayout& L, int64_t gy, cudaStream_t s, const unsigned long long* grp_ptr,
+                      const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X,
+                      block_q8_1* hq) {
+    if constexpr (!kSplit<TG>) {
+        return false;
+    } else {
+        if (g_old_kernels || g_no_sub16_gu || L.n_embd != 2560 || L.n_ff % 32 != 0 || L.n_ff <= 0) return false;
+        const dim3 grid((unsigned) (L.n_ff / 32), (unsigned) gy);
+        bool stage = false;
+        if constexpr (kStageIqGrid<TG>) stage = g_stage_grid;
+        if constexpr (kStageIqGrid<TG>) {
+            if (stage) native_gu_swiglu_kernel<TG, true><<<grid, 512, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq);
+            else native_gu_swiglu_kernel<TG, false><<<grid, 512, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq);
+        } else {
+            native_gu_swiglu_kernel<TG, false><<<grid, 512, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq);
+        }
+        return true;
+    }
+}
+
+
 template<int TD>
 void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L,
@@ -3691,9 +3848,28 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         }
         check("native_expert_grouped/gu fused");
     }
-    if (g_exp_phase != 2 && !fused_gu) {
+#endif
+    // 147-verify STRATA_GU_SWIGLU=1 (port of upstream 75afe3f4): gate/up + SwiGLU + q8_1 in one launch where the CUDA
+    // layout's 16-lane kernel would run
+    bool gs_done = false;
+#if STRATA_EXP_LAYOUTS
+    const bool gs_layout = !fused_gu && em0 == 0;
 #else
-    if (g_exp_phase != 2) {
+    const bool gs_layout = true;
+#endif
+    if (gs_layout && g_exp_phase == 0 && !v1 && gu_swiglu_on()) {
+        switch (L.gu_type) {
+#define STRATA_GS(T) case T: gs_done = launch_gu_swiglu<T>(L, gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, hq); break;
+            STRATA_GU_FMTS(STRATA_GS)
+#undef STRATA_GS
+            default: break;
+        }
+        if (gs_done) check("native_expert_grouped/gu+swiglu");
+    }
+#if STRATA_EXP_LAYOUTS
+    if (g_exp_phase != 2 && !fused_gu && !gs_done) {
+#else
+    if (g_exp_phase != 2 && !gs_done) {
 #endif
 #if STRATA_EXP_LAYOUTS
     const bool lds_gu = (em0 == 5 || em0 == 6 || em0 == 7 || em0 == 8) && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23);
