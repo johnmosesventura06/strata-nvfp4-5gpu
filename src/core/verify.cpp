@@ -171,12 +171,12 @@ bool head_mix_multi_enabled() {
 #endif
 }
 
-bool one_token_self_commit() {
-#if defined(STRATA_USE_HIP)
-    return false;
 // fork 34a35db + b063c13 (Eddoursul), STRATA_SIDE_MIXER=1 / =2 (opt-in): the mixer's work that reads only the layer's
 // input on branches of the window's graph (bitwise the same outputs); 0 / unset = in line, and no branch stream is created
 inline int g_side_mixer() { static const int m = [] { const char* v = std::getenv("STRATA_SIDE_MIXER"); return v ? std::max(0, std::min(2, std::atoi(v))) : 0; }(); return m; }
+bool one_token_self_commit() {
+#if defined(STRATA_USE_HIP)
+    return false;
 #else
     static const bool on = [] {
         const char* v = std::getenv("STRATA_ONE_TOKEN_COMMIT");
