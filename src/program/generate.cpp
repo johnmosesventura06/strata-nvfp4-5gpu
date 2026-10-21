@@ -117,6 +117,7 @@
 #include <string>
 #include <set>
 #include <vector>
+#include <unordered_map>
 
 namespace {
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
@@ -7610,6 +7611,17 @@ int main(int argc, char** argv) {
             uint64_t bytes = 0;
         };
         std::vector<JournalEntry> journal_index;
+        // STRATA_JOURNAL_DELTA=1 (conversation_file.hpp): a park writes only the chunks that differ from an earlier
+        // journal file of the same conversation; every file gets a `.map` sidecar (its chunk hashes) and this registry
+        // keeps them by path - mounts do not drop entries here (the file stays a parent for the next park)
+        static const bool journal_delta = [] { const char* v = std::getenv("STRATA_JOURNAL_DELTA"); return v && v[0] == '1'; }();
+        constexpr uint64_t kJournalChunk = (uint64_t) 1 << 20;
+        constexpr int kJournalMaxDepth = 4;   // after 4 deltas the next park writes a whole file
+        std::unordered_map<std::string, strata::core::SessionChunkMap> journal_maps;
+        auto journal_leaf = [](const std::string& path) {
+            const size_t at = path.find_last_of("/\\");
+            return at == std::string::npos ? path : path.substr(at + 1);
+        };
         // dedupe witness: the last state actually written to the journal (turn-end PARK and the next
         // switch-park capture the same unchanged conversation; a second write is pure NVMe wear).
         // 10-15 audit: the witness is a CONTENT hash (FNV-1a over the live ids, same scheme as the file
@@ -7626,19 +7638,37 @@ int main(int argc, char** argv) {
                 if (de.is_regular_file(ec) && de.path().filename().string().rfind("conv-", 0) == 0) {
                     const uint64_t sz = (uint64_t) de.file_size(ec);
                     total += sz;
-                    fs.emplace_back(de.last_write_time(ec), std::make_pair(sz, de.path().string()));
+                    const std::string name = de.path().filename().string();
+                    const bool side = name.size() > 4 && (name.compare(name.size() - 4, 4, ".map") == 0 ||
+                                                          name.compare(name.size() - 4, 4, ".tmp") == 0);
+                    if (!journal_delta || !side)   // delta mode: maps go with their file, never on their own
+                        fs.emplace_back(de.last_write_time(ec), std::make_pair(sz, de.path().string()));
                 }
             if (total <= cap) return;
             std::sort(fs.begin(), fs.end());          // oldest first
+            // delta mode: removing a file removes its map and every delta built on it (they cannot be read without it)
+            std::function<void(const std::string&)> drop = [&](const std::string& path) {
+                std::error_code rec;
+                const uint64_t sz = std::filesystem::exists(path, rec) ? (uint64_t) std::filesystem::file_size(path, rec) : 0;
+                if (!std::filesystem::remove(path, rec) || rec) return;
+                total -= std::min(total, sz);
+                ++journal_pruned;
+                journal_index.erase(std::remove_if(journal_index.begin(), journal_index.end(),
+                    [&](const JournalEntry& e) { return e.path == path; }), journal_index.end());
+                if (!journal_delta) return;
+                const std::string mp = path + ".map";
+                const uint64_t msz = std::filesystem::exists(mp, rec) ? (uint64_t) std::filesystem::file_size(mp, rec) : 0;
+                if (std::filesystem::remove(mp, rec) && !rec) total -= std::min(total, msz);
+                journal_maps.erase(path);
+                const std::string leaf = journal_leaf(path);
+                std::vector<std::string> kids;
+                for (const auto& [kp, km] : journal_maps) if (km.parent == leaf) kids.push_back(kp);
+                for (const auto& kp : kids) drop(kp);
+            };
             for (auto& [mt, sp] : fs) {
                 if (total <= cap) break;
                 std::error_code rec;
-                if (std::filesystem::remove(sp.second, rec) && !rec) {
-                    total -= sp.first;
-                    ++journal_pruned;
-                    journal_index.erase(std::remove_if(journal_index.begin(), journal_index.end(),
-                        [&](const JournalEntry& e) { return e.path == sp.second; }), journal_index.end());
-                }
+                if (std::filesystem::exists(sp.second, rec)) drop(sp.second);   // (a delta may already be gone with its parent)
             }
             std::fprintf(stderr, "strata serve: conversation journal: pruned to the cap, %zu file(s) deleted, %.1f GiB left\n",
                          journal_pruned, (double) total / (1u << 30));
@@ -7664,6 +7694,77 @@ int main(int argc, char** argv) {
             size_t written = 0;
             std::string jerr;
             const auto t0j = Clock::now();
+            if (journal_delta) {
+                std::error_code fec;
+                auto known = journal_maps.find(path);
+                if (known != journal_maps.end() && std::filesystem::exists(path, fec)) {
+                    // this exact state (the name is its ids' hash) is already on disk - and later deltas may be built
+                    // on that file, so it is never rewritten in place
+                    std::fprintf(stderr, "strata serve: conversation journal: %zu tokens already on disk; not rewritten\n",
+                                 (size_t) image.live.ids.size());
+                    bool listed = false;   // a mount took it off the index: it is mountable again
+                    for (const auto& e : journal_index) listed = listed || e.path == path;
+                    if (!listed) {
+                        JournalEntry ne;
+                        ne.path = path; ne.ids = known->second.live_ids; ne.imgs = known->second.live_imgs;
+                        ne.cvec = known->second.cvec;
+                        for (const uint64_t L : known->second.ck_lens)
+                            if (L <= ne.ids.size()) ne.cks.emplace_back(ne.ids.begin(), ne.ids.begin() + (long) L);
+                        ne.bytes = (uint64_t) std::filesystem::file_size(path, fec);
+                        journal_index.push_back(std::move(ne));
+                    }
+                    return true;
+                }
+                strata::core::SessionChunkMap mine;
+                strata::core::session_chunk_map_build(image, kJournalChunk, mine);
+                const double hash_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0j).count();
+                // the parent: the deepest file whose live ids are a proper prefix of this state's, under the depth cap
+                const strata::core::SessionChunkMap* par = nullptr;
+                std::string par_path;
+                for (const auto& [pp, pm] : journal_maps) {
+                    if (pm.depth >= kJournalMaxDepth || pm.chunk != kJournalChunk || pm.cvec != image.cvec) continue;
+                    if (pm.live_ids.size() >= image.live.ids.size()) continue;
+                    if (par && pm.live_ids.size() <= par->live_ids.size()) continue;
+                    if (!std::equal(pm.live_ids.begin(), pm.live_ids.end(), image.live.ids.begin())) continue;
+                    if (!std::filesystem::exists(pp, fec)) continue;
+                    par = &pm;
+                    par_path = pp;
+                }
+                bool wrote_ok;
+                if (par) {
+                    mine.depth = par->depth + 1;
+                    mine.parent = journal_leaf(par_path);
+                    wrote_ok = strata::core::session_file_write_delta(path, image, jid, mine.parent, *par, mine, written, jerr, wo);
+                } else {
+                    wrote_ok = strata::core::session_file_write(path, image, jid, written, jerr, wo);
+                }
+                if (!wrote_ok) {
+                    std::fprintf(stderr, "strata serve: conversation journal: write failed (%s); RAM park unaffected\n", jerr.c_str());
+                    return false;
+                }
+                std::string merr;
+                if (!strata::core::session_chunk_map_write(path + ".map", mine, merr)) {
+                    std::fprintf(stderr, "strata serve: conversation journal: %s\n", merr.c_str());
+                    if (par) {   // a delta cannot be verified without its map: it does not stay
+                        std::filesystem::remove(path, fec);
+                        return false;
+                    }
+                } else {
+                    if (par)   // the chain stays fresh while it is in use: pruning takes the oldest files first
+                        for (std::string up = par_path; !up.empty();) {
+                            std::filesystem::last_write_time(up, std::filesystem::file_time_type::clock::now(), fec);
+                            auto it = journal_maps.find(up);
+                            up = it == journal_maps.end() || it->second.parent.empty() ? std::string()
+                                 : o.conversation_cache_dir + "/" + it->second.parent;
+                        }
+                    journal_maps[path] = std::move(mine);
+                }
+                std::fprintf(stderr, "strata serve: conversation journal: wrote %zu tokens, %.2f GiB in %.0f ms (%s; hashing %.0f ms)\n",
+                             (size_t) image.live.ids.size(), (double) written / (1u << 30),
+                             std::chrono::duration<double, std::milli>(Clock::now() - t0j).count(),
+                             par ? ("delta on " + std::to_string(par->live_ids.size()) + " tokens, depth " +
+                                    std::to_string(par->depth + 1)).c_str() : "whole file", hash_ms);
+            } else {
             if (!strata::core::session_file_write(path, image, jid, written, jerr, wo)) {
                 std::fprintf(stderr, "strata serve: conversation journal: write failed (%s); RAM park unaffected\n", jerr.c_str());
                 return false;
@@ -7671,6 +7772,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: conversation journal: wrote %zu tokens, %.1f GiB in %.0f ms\n",
                          (size_t) image.live.ids.size(), (double) written / (1u << 30),
                          std::chrono::duration<double, std::milli>(Clock::now() - t0j).count());
+            }
             // keep the disk index current: the file we just wrote is the deepest copy of this prefix
             bool jr_replaced = false;
             for (auto& e : journal_index)
@@ -7703,9 +7805,43 @@ int main(int argc, char** argv) {
             }
             std::vector<std::pair<std::filesystem::file_time_type, std::string>> fs;
             for (auto& de : std::filesystem::directory_iterator(o.conversation_cache_dir, ec))
-                if (de.is_regular_file(ec) && de.path().filename().string().rfind("conv-", 0) == 0)
-                    fs.emplace_back(de.last_write_time(ec), de.path().string());
+                if (de.is_regular_file(ec) && de.path().filename().string().rfind("conv-", 0) == 0) {
+                    const std::string name = de.path().filename().string();
+                    const bool side = name.size() > 4 && (name.compare(name.size() - 4, 4, ".map") == 0 ||
+                                                          name.compare(name.size() - 4, 4, ".tmp") == 0);
+                    if (!side) fs.emplace_back(de.last_write_time(ec), de.path().string());
+                }
             std::sort(fs.rbegin(), fs.rend());        // newest first: the freshest conversations get the RAM
+            if (journal_delta) {   // the maps; a delta whose chain is broken cannot be read: it goes (with its own deltas)
+                for (auto& [mt, path] : fs) {
+                    strata::core::SessionChunkMap m;
+                    std::string merr;
+                    if (std::filesystem::exists(path + ".map", ec) && strata::core::session_chunk_map_read(path + ".map", m, merr))
+                        journal_maps[path] = std::move(m);
+                }
+                size_t orphans = 0;
+                for (bool again = true; again;) {
+                    again = false;
+                    for (auto it = journal_maps.begin(); it != journal_maps.end(); ++it) {
+                        if (it->second.parent.empty()) continue;
+                        const std::string pp = o.conversation_cache_dir + "/" + it->second.parent;
+                        if (journal_maps.count(pp)) continue;
+                        std::error_code rec;
+                        std::filesystem::remove(it->first, rec);
+                        std::filesystem::remove(it->first + ".map", rec);
+                        journal_maps.erase(it);
+                        ++orphans;
+                        again = true;
+                        break;
+                    }
+                }
+                fs.erase(std::remove_if(fs.begin(), fs.end(), [&](const auto& f) {
+                    std::error_code rec;
+                    return !std::filesystem::exists(f.second, rec);
+                }), fs.end());
+                std::fprintf(stderr, "strata serve: conversation journal: delta mode, %zu map(s) loaded, %zu orphaned delta(s) removed\n",
+                             journal_maps.size(), orphans);
+            }
             strata::core::SessionFileIdentity jid;
             std::string e;
             if (!session_identity(jid, e, [] {})) {
@@ -7735,7 +7871,18 @@ int main(int argc, char** argv) {
                 JournalEntry je;
                 uint64_t jb = 0;
                 std::string jerr;
-                if (strata::core::session_file_prefix_read(path, jid, je.ids, je.imgs, je.cvec, jb, jerr, limits, &je.cks)) {
+                auto jm = journal_delta ? journal_maps.find(path) : journal_maps.end();
+                if (jm != journal_maps.end() && !jm->second.parent.empty()) {   // a delta: indexed from its map
+                    je.path = path;
+                    je.ids = jm->second.live_ids;
+                    je.imgs = jm->second.live_imgs;
+                    je.cvec = jm->second.cvec;
+                    for (const uint64_t L : jm->second.ck_lens)
+                        if (L <= je.ids.size()) je.cks.emplace_back(je.ids.begin(), je.ids.begin() + (long) L);
+                    std::error_code rec;
+                    je.bytes = (uint64_t) std::filesystem::file_size(path, rec);
+                    journal_index.push_back(std::move(je));
+                } else if (strata::core::session_file_prefix_read(path, jid, je.ids, je.imgs, je.cvec, jb, jerr, limits, &je.cks)) {
                     je.path = path;
                     je.bytes = jb;
                     journal_index.push_back(std::move(je));

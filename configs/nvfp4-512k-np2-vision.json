@@ -54,7 +54,9 @@
   "--peer-prefill-rows",
   "1536",
   "--conversation-cache-mib",
-  "0",
+  "16384",
+  "--conversation-cache-slots",
+  "16",
   "--conversation-cache-dir",
   "journal",
   "--ple-row-cache",
@@ -83,7 +85,8 @@
   "STRATA_LEND_SHADOW": "1",
   "STRATA_GR_V6": "5",
   "STRATA_MMA_Q8": "1",
-  "STRATA_MTP_ATTN_FAST": "1"
+  "STRATA_MTP_ATTN_FAST": "1",
+  "STRATA_JOURNAL_DELTA": "1"
  },
  "host": "0.0.0.0",
  "port": 8190,

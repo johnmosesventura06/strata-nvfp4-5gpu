@@ -250,4 +250,43 @@ bool session_file_prefix_read(const std::string& path, const SessionFileIdentity
 // folder (\\server\share\dir\) and gives a drive root (C:\); empty for a bare file name (the current folder).
 std::string session_free_space_dir(const std::string& path, bool windows_rules);
 
+
+// ---- delta journal files (STRATA_JOURNAL_DELTA=1, the serve journal) ----
+// A conversation that grows by a turn keeps its K/V prefix and its earlier checkpoints byte for byte, so a park can
+// write only what changed against an earlier journal file of the same conversation (its "parent"): every section
+// (each checkpoint state array, each K/V buffer) is cut into `chunk`-byte chunks and a chunk whose hash equals the
+// parent's chunk at the same place is referenced instead of written.  Lossless: a mount rebuilds the image from the
+// parent chain and the delta, then checks EVERY chunk against the map recorded when the image was parked (the file's
+// `.map` sidecar) - any difference refuses the mount (the request reads its prompt instead, as for any bad file).
+
+/// The sections of an image as hashed chunks, plus what the journal index needs without reading the file.
+/// Sections, in order: the live state's 5 arrays (gdn, ple, tails, dead, block_pos), each checkpoint's 5, then each
+/// K/V layer's 5 buffers (k, v, k_scale, v_scale, pooled).
+struct SessionChunkMap {
+    uint64_t chunk = 0;
+    std::vector<uint64_t> sizes;                  ///< per section, in bytes
+    std::vector<std::vector<uint64_t>> hashes;    ///< per section, one per chunk
+    std::vector<uint64_t> ck_lens;                ///< the checkpoints' token counts, in file order
+    uint64_t n_kv = 0;                            ///< K/V layers
+    std::vector<int32_t> live_ids;
+    std::vector<ConversationImageKey> live_imgs;
+    bool cvec = false;
+    int depth = 0;                                ///< 0: a whole file; n: n deltas above a whole file
+    std::string parent;                           ///< a delta's parent file (leaf name, same directory)
+};
+/// The map of `image` (hashes every byte: ~0.2 s per GiB on one core).
+void session_chunk_map_build(const SavedConversation& image, uint64_t chunk, SessionChunkMap& map);
+/// The `.map` sidecar: written atomically (temp + rename), checksummed.
+bool session_chunk_map_write(const std::string& path, const SessionChunkMap& map, std::string& error);
+bool session_chunk_map_read(const std::string& path, SessionChunkMap& map, std::string& error);
+/// A delta of `image` against `parent` (its map; the parent file is `parent_leaf` beside `path`); `mine` is image's
+/// own map.  Same atomic publish, header and payload checksum as session_file_write; another magic, so engines
+/// without delta support refuse the file instead of misreading it.  session_file_read reads either kind.
+bool session_file_write_delta(const std::string& path, const SavedConversation& image, const SessionFileIdentity& id,
+                              const std::string& parent_leaf, const SessionChunkMap& parent,
+                              const SessionChunkMap& mine, size_t& bytes, std::string& error,
+                              const SessionWriteOptions& options = {});
+/// True when the file at `path` is a delta (its magic), without reading further.
+bool session_file_is_delta(const std::string& path);
+
 } // namespace strata::core

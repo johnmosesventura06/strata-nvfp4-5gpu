@@ -114,6 +114,9 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(conversation_file_test src/core/conversation_file_test.cpp src/core/conversation_file.cpp)
   target_include_directories(conversation_file_test PRIVATE include)
   add_test(NAME conversation_file_test COMMAND conversation_file_test)
+  # the delta journal on real journal files (CPU only): delta write, mount rebuild + verification, byte compare
+  add_executable(journal_delta_check src/core/journal_delta_check.cpp src/core/conversation_file.cpp)
+  target_include_directories(journal_delta_check PRIVATE include)
 endif()
 
 if(STRATA_HIP_GFX906)

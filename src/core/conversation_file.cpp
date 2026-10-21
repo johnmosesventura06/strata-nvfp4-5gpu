@@ -1032,6 +1032,347 @@ uint64_t session_read_peak_bytes(uint64_t file_bytes) {
     return sat_add(sat_add(sat_add(file_bytes, kBlock), sat_mul(segments, 4096)), uint64_t(1) << 20);
 }
 
+
+// ===================== delta journal files (conversation_file.hpp: STRATA_JOURNAL_DELTA) =====================
+namespace {
+constexpr char kMagicDelta[8] = {'S', 'T', 'R', 'S', 'D', 'L', 'T', '\x01'};
+constexpr uint64_t kChunkSeed = 0x9e3779b97f4a7c15ULL;
+constexpr int kStateArrays = 5, kKvParts = 5;
+
+const std::vector<uint8_t>& state_arr(const ConversationCheckpoint& c, int i) {
+    return i == 0 ? c.gdn : i == 1 ? c.ple : i == 2 ? c.tails : i == 3 ? c.dead : c.block_pos;
+}
+std::vector<uint8_t>& state_arr(ConversationCheckpoint& c, int i) {
+    return i == 0 ? c.gdn : i == 1 ? c.ple : i == 2 ? c.tails : i == 3 ? c.dead : c.block_pos;
+}
+const ConversationBuffer& kv_part(const ConversationKv& k, int i) {
+    return i == 0 ? k.k : i == 1 ? k.v : i == 2 ? k.k_scale : i == 3 ? k.v_scale : k.pooled;
+}
+ConversationBuffer& kv_part(ConversationKv& k, int i) {
+    return i == 0 ? k.k : i == 1 ? k.v : i == 2 ? k.k_scale : i == 3 ? k.v_scale : k.pooled;
+}
+uint64_t chunk_hash_vec(const std::vector<uint8_t>& v, size_t at, size_t n) {
+    SessionHasher h(kChunkSeed);
+    h.update(v.data() + at, n);
+    return h.digest();
+}
+uint64_t chunk_hash_buf(const ConversationBuffer& b, size_t at, size_t n) {
+    SessionHasher h(kChunkSeed);
+    b.visit(at, n, [&](const uint8_t* p, size_t c, size_t) { h.update(p, c); return true; });
+    return h.digest();
+}
+void map_vec(const std::vector<uint8_t>& v, uint64_t chunk, SessionChunkMap& m) {
+    m.sizes.push_back(v.size());
+    auto& hs = m.hashes.emplace_back();
+    for (size_t at = 0; at < v.size(); at += chunk) hs.push_back(chunk_hash_vec(v, at, std::min<size_t>(chunk, v.size() - at)));
+}
+void map_buf(const ConversationBuffer& b, uint64_t chunk, SessionChunkMap& m) {
+    m.sizes.push_back(b.size());
+    auto& hs = m.hashes.emplace_back();
+    for (size_t at = 0; at < b.size(); at += chunk) hs.push_back(chunk_hash_buf(b, at, std::min<size_t>(chunk, b.size() - at)));
+}
+// section index helpers (conversation_file.hpp: live 0..4, checkpoint k at 5 + 5k, K/V layer l after the checkpoints)
+size_t sec_ck(size_t k, int i) { return (size_t) kStateArrays * (1 + k) + (size_t) i; }
+size_t sec_kv(const SessionChunkMap& m, size_t l, int i) { return (size_t) kStateArrays * (1 + m.ck_lens.size()) + (size_t) kKvParts * l + (size_t) i; }
+// a chunk of `mine` section `ms` equals the parent's section `ps` chunk j: same length, same hash
+bool same_chunk(const SessionChunkMap& mine, size_t ms, const SessionChunkMap* par, size_t ps, size_t j) {
+    if (par == nullptr || ps >= par->hashes.size() || j >= par->hashes[ps].size()) return false;
+    const uint64_t c = mine.chunk, mlen = std::min<uint64_t>(c, mine.sizes[ms] - j * c);
+    const uint64_t plen = std::min<uint64_t>(c, par->sizes[ps] - j * c);
+    return mlen == plen && par->hashes[ps][j] == mine.hashes[ms][j];
+}
+// a section: its size, then per chunk a flag byte (0: the parent's chunk, 1: these bytes follow)
+void put_delta_vec(Out& o, const std::vector<uint8_t>& v, const SessionChunkMap& mine, size_t ms,
+                   const SessionChunkMap* par, size_t ps) {
+    o.u64(v.size());
+    for (size_t j = 0, at = 0; at < v.size(); ++j, at += mine.chunk) {
+        const size_t n = std::min<size_t>(mine.chunk, v.size() - at);
+        const uint8_t flag = same_chunk(mine, ms, par, ps, j) ? 0 : 1;
+        o.raw(&flag, 1);
+        if (flag) o.raw(v.data() + at, n);
+    }
+}
+void put_delta_buf(Out& o, const ConversationBuffer& b, const SessionChunkMap& mine, size_t ms,
+                   const SessionChunkMap* par, size_t ps) {
+    o.u64(b.size());
+    for (size_t j = 0, at = 0; at < b.size(); ++j, at += mine.chunk) {
+        const size_t n = std::min<size_t>(mine.chunk, b.size() - at);
+        const uint8_t flag = same_chunk(mine, ms, par, ps, j) ? 0 : 1;
+        o.raw(&flag, 1);
+        if (flag) b.visit(at, n, [&](const uint8_t* p, size_t c, size_t) { o.raw(p, c); return o.ok; });
+    }
+}
+void put_ids_imgs(Out& o, const ConversationCheckpoint& c) {
+    o.vec(c.ids);
+    o.u64(c.imgs.size());
+    for (const auto& k : c.imgs) { o.i64(k.start); o.u64(k.hash); }
+}
+// The delta payload.  The live state is written whole (it moves every turn); checkpoint k refers to the parent's
+// checkpoint with the same token count (code >= 0), or the parent's live state when that is the one (-2), or none (-1).
+void put_payload_delta(Out& o, const SavedConversation& s, const std::string& parent_leaf, const SessionChunkMap& par,
+                       const SessionChunkMap& mine) {
+    o.u64(parent_leaf.size());
+    o.raw(parent_leaf.data(), parent_leaf.size());
+    o.u64(mine.chunk);
+    for (int64_t g : s.geometry) o.i64(g);
+    o.i64(s.layer_lo); o.i64(s.layer_hi); o.u64(s.cvec ? 1 : 0);
+    put_ids_imgs(o, s.live);
+    for (int i = 0; i < kStateArrays; ++i) put_delta_vec(o, state_arr(s.live, i), mine, (size_t) i, nullptr, 0);
+    o.u64(s.live.used);
+    o.u64(s.checkpoints.size());
+    for (size_t k = 0; k < s.checkpoints.size(); ++k) {
+        const auto& c = s.checkpoints[k];
+        int64_t ref = -1;
+        for (size_t pk = 0; pk < par.ck_lens.size(); ++pk)
+            if (par.ck_lens[pk] == c.ids.size()) { ref = (int64_t) pk; break; }
+        if (ref < 0 && par.live_ids.size() == c.ids.size()) ref = -2;
+        o.i64(ref);
+        put_ids_imgs(o, c);
+        for (int i = 0; i < kStateArrays; ++i)
+            put_delta_vec(o, state_arr(c, i), mine, sec_ck(k, i), ref == -1 ? nullptr : &par,
+                          ref >= 0 ? sec_ck((size_t) ref, i) : (size_t) i);
+        o.u64(c.used);
+    }
+    o.u64(s.kv.size());
+    for (size_t l = 0; l < s.kv.size(); ++l) {
+        const auto& k = s.kv[l];
+        put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
+        const bool has = l < par.n_kv;
+        for (int i = 0; i < kKvParts; ++i)
+            put_delta_buf(o, kv_part(k, i), mine, sec_kv(mine, l, i), has ? &par : nullptr, has ? sec_kv(par, l, i) : 0);
+    }
+}
+// reading: a section from the delta, starting from the parent's section (moved in, never copied)
+bool get_delta_vec(In& in, std::vector<uint8_t>& dst, std::vector<uint8_t>* from, uint64_t chunk, uint64_t limit) {
+    uint64_t n = 0;
+    if (!in.u64(n)) return false;
+    if (n > limit) return in.fail("delta section exceeds this engine's limit");
+    if (from) dst = std::move(*from); else dst.clear();
+    const size_t base = dst.size();
+    dst.resize((size_t) n);
+    for (size_t at = 0; at < n; at += chunk) {
+        const size_t c = std::min<size_t>(chunk, n - at);
+        uint8_t flag = 0;
+        if (!in.raw(&flag, 1)) return false;
+        if (flag == 1) { if (!in.raw(dst.data() + at, c)) return false; }
+        else if (flag != 0 || from == nullptr || at + c > base) return in.fail("delta chunk refers to bytes its parent does not have");
+    }
+    return true;
+}
+bool get_delta_buf(In& in, ConversationBuffer& dst, ConversationBuffer* from, uint64_t chunk, uint64_t limit) {
+    uint64_t n = 0;
+    if (!in.u64(n)) return false;
+    if (n > limit) return in.fail("delta section exceeds this engine's limit");
+    if (from) dst = std::move(*from); else dst = {};
+    const size_t base = dst.size();
+    dst.resize((size_t) n);
+    for (size_t at = 0; at < n; at += chunk) {
+        const size_t c = std::min<size_t>(chunk, n - at);
+        uint8_t flag = 0;
+        if (!in.raw(&flag, 1)) return false;
+        if (flag == 1) { if (!dst.visit(at, c, [&](uint8_t* p, size_t m, size_t) { return in.raw(p, m); })) return false; }
+        else if (flag != 0 || from == nullptr || at + c > base) return in.fail("delta chunk refers to bytes its parent does not have");
+    }
+    return true;
+}
+bool get_ids_imgs(In& in, ConversationCheckpoint& c) {
+    if (!in.vec(c.ids, in.limits.max_tokens)) return false;
+    uint64_t n = 0;
+    if (!in.count(n, 16, in.limits.max_tokens)) return false;
+    c.imgs.resize((size_t) n);
+    for (auto& k : c.imgs) if (!in.i64(k.start) || !in.u64(k.hash)) return false;
+    return true;
+}
+bool split_dir_leaf(const std::string& path, std::string& dir) {
+    const size_t at = path.find_last_of("/\\");
+    dir = at == std::string::npos ? std::string(".") : path.substr(0, at);
+    return true;
+}
+bool read_delta_payload(In& in, const std::string& path, const SessionFileIdentity& id, SavedConversation& s,
+                        const SessionReadLimits& limits) {
+    uint64_t ln = 0;
+    if (!in.count(ln, 1, 256)) return false;
+    std::string leaf(ln, '\0');
+    if (!in.raw(leaf.data(), ln)) return false;
+    if (leaf.empty() || leaf.find_first_of("/\\") != std::string::npos || leaf.rfind("conv-", 0) != 0)
+        return in.fail("invalid delta parent name");
+    uint64_t chunk = 0;
+    if (!in.u64(chunk) || chunk < 4096 || chunk > ((uint64_t) 1 << 30)) return in.fail("invalid delta chunk size");
+    // the parent first (a delta itself, or a whole file): the image is built in its place
+    std::string dir;
+    split_dir_leaf(path, dir);
+    SavedConversation p;
+    size_t pbytes = 0;
+    std::string perr;
+    if (!session_file_read(dir + "/" + leaf, id, p, pbytes, perr, limits))
+        return in.fail("delta parent " + leaf + ": " + perr);
+    for (auto& g : s.geometry) if (!in.i64(g)) return false;
+    if (s.geometry != p.geometry) return in.fail("delta and parent differ in geometry");
+    uint64_t cvec = 0;
+    if (!in.i64(s.layer_lo) || !in.i64(s.layer_hi) || !in.u64(cvec)) return false;
+    if (s.layer_lo != p.layer_lo || s.layer_hi != p.layer_hi || cvec > 1) return in.fail("delta and parent differ in layers");
+    s.cvec = cvec == 1;
+    const auto& m = limits.max_state_bytes;
+    if (!get_ids_imgs(in, s.live)) return false;
+    for (int i = 0; i < kStateArrays; ++i)
+        if (!get_delta_vec(in, state_arr(s.live, i), nullptr, chunk, m[i])) return false;
+    if (!in.u64(s.live.used)) return false;
+    uint64_t nck = 0;
+    if (!in.count(nck, 8, limits.max_checkpoints)) return false;
+    s.checkpoints.resize((size_t) nck);
+    std::vector<bool> taken(p.checkpoints.size() + 1, false);   // each parent state moves into one checkpoint at most
+    for (auto& c : s.checkpoints) {
+        int64_t ref = 0;
+        if (!in.i64(ref)) return false;
+        ConversationCheckpoint* from = nullptr;
+        if (ref >= 0 && (uint64_t) ref < p.checkpoints.size() && !taken[(size_t) ref]) { from = &p.checkpoints[(size_t) ref]; taken[(size_t) ref] = true; }
+        else if (ref == -2 && !taken.back()) { from = &p.live; taken.back() = true; }
+        else if (ref != -1) return in.fail("delta checkpoint refers to a parent state it does not have");
+        if (!get_ids_imgs(in, c)) return false;
+        for (int i = 0; i < kStateArrays; ++i)
+            if (!get_delta_vec(in, state_arr(c, i), from ? &state_arr(*from, i) : nullptr, chunk, m[i])) return false;
+        if (!in.u64(c.used)) return false;
+    }
+    uint64_t nkv = 0;
+    if (!in.count(nkv, 56, limits.max_kv_layers)) return false;
+    s.kv.resize((size_t) nkv);
+    for (size_t l = 0; l < s.kv.size(); ++l) {
+        auto& k = s.kv[l];
+        in.kv_layer = l;
+        int64_t format = 0;
+        if (!in.i64(format) || !in.i64(k.cells) || !in.i64(k.heads) || !in.i64(k.head_dim) ||
+            !in.i64(k.page_size) || !in.i64(k.pooled_rows) || !in.i64(k.idx_dim)) return false;
+        if (format < INT32_MIN || format > INT32_MAX) return in.fail("invalid K/V format");
+        k.format = (int) format;
+        ConversationKv* from = l < p.kv.size() ? &p.kv[l] : nullptr;
+        if (from && (from->format != k.format || from->heads != k.heads || from->head_dim != k.head_dim ||
+                     from->page_size != k.page_size || from->idx_dim != k.idx_dim))
+            return in.fail("delta K/V layer differs from its parent's layout");
+        for (int i = 0; i < kKvParts; ++i) {
+            const uint64_t lim = l < limits.max_kv_bytes.size() ? limits.max_kv_bytes[l][(size_t) i] : UINT64_MAX;
+            if (!get_delta_buf(in, kv_part(k, i), from ? &kv_part(*from, i) : nullptr, chunk, lim)) return false;
+        }
+    }
+    return true;
+}
+// every section of the rebuilt image against the map recorded when it was parked
+bool verify_against_map(const SavedConversation& s, const SessionChunkMap& want, std::string& error) {
+    SessionChunkMap got;
+    session_chunk_map_build(s, want.chunk, got);
+    if (got.sizes != want.sizes || got.hashes != want.hashes || got.ck_lens != want.ck_lens || got.n_kv != want.n_kv ||
+        got.live_ids != want.live_ids || got.live_imgs != want.live_imgs || got.cvec != want.cvec) {
+        error = "session file: the rebuilt delta image does not match its map (a parent changed or is damaged)";
+        return false;
+    }
+    return true;
+}
+} // namespace
+
+void session_chunk_map_build(const SavedConversation& s, uint64_t chunk, SessionChunkMap& m) {
+    m = {};
+    m.chunk = chunk;
+    m.live_ids = s.live.ids;
+    m.live_imgs = s.live.imgs;
+    m.cvec = s.cvec;
+    for (int i = 0; i < kStateArrays; ++i) map_vec(state_arr(s.live, i), chunk, m);
+    for (const auto& c : s.checkpoints) {
+        m.ck_lens.push_back(c.ids.size());
+        for (int i = 0; i < kStateArrays; ++i) map_vec(state_arr(c, i), chunk, m);
+    }
+    m.n_kv = s.kv.size();
+    for (const auto& k : s.kv)
+        for (int i = 0; i < kKvParts; ++i) map_buf(kv_part(k, i), chunk, m);
+}
+
+namespace {
+constexpr char kMapMagic[8] = {'S', 'T', 'R', 'S', 'M', 'A', 'P', '\x01'};
+void map_put(std::string& b, const void* p, size_t n) { b.append((const char*) p, n); }
+void map_u64(std::string& b, uint64_t v) { map_put(b, &v, 8); }
+struct MapIn {
+    const std::string& b;
+    size_t at = 0;
+    bool ok = true;
+    bool raw(void* p, size_t n) { if (!ok || n > b.size() - at) return ok = false; std::memcpy(p, b.data() + at, n); at += n; return true; }
+    uint64_t u64() { uint64_t v = 0; raw(&v, 8); return v; }
+    bool count(uint64_t& n, size_t elem) { n = u64(); if (!ok || (elem && n > (b.size() - at) / elem)) return ok = false; return true; }
+};
+}  // namespace
+
+bool session_chunk_map_write(const std::string& path, const SessionChunkMap& m, std::string& error) {
+    std::string b;
+    map_put(b, kMapMagic, 8);
+    map_u64(b, m.chunk); map_u64(b, (uint64_t) m.depth); map_u64(b, m.cvec ? 1 : 0); map_u64(b, m.n_kv);
+    map_u64(b, m.parent.size()); map_put(b, m.parent.data(), m.parent.size());
+    map_u64(b, m.live_ids.size()); map_put(b, m.live_ids.data(), m.live_ids.size() * 4);
+    map_u64(b, m.live_imgs.size());
+    for (const auto& k : m.live_imgs) { map_u64(b, (uint64_t) k.start); map_u64(b, k.hash); }
+    map_u64(b, m.ck_lens.size()); map_put(b, m.ck_lens.data(), m.ck_lens.size() * 8);
+    map_u64(b, m.sizes.size());
+    for (size_t i = 0; i < m.sizes.size(); ++i) {
+        map_u64(b, m.sizes[i]);
+        map_u64(b, m.hashes[i].size());
+        map_put(b, m.hashes[i].data(), m.hashes[i].size() * 8);
+    }
+    map_u64(b, session_hash64(b.data(), b.size(), kChunkSeed));
+    const std::string tmp = path + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) { error = "chunk map: cannot create " + tmp; return false; }
+    const bool wrote = std::fwrite(b.data(), 1, b.size(), f) == b.size();
+    const bool closed = std::fclose(f) == 0;
+    std::error_code ec;
+    if (!wrote || !closed) { std::filesystem::remove(tmp, ec); error = "chunk map: write failed for " + tmp; return false; }
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) { std::filesystem::remove(tmp, ec); error = "chunk map: cannot publish " + path; return false; }
+    return true;
+}
+
+bool session_chunk_map_read(const std::string& path, SessionChunkMap& m, std::string& error) {
+    m = {};
+    std::string b;
+    {
+        FILE* f = std::fopen(path.c_str(), "rb");
+        if (f == nullptr) { error = "chunk map: cannot open " + path; return false; }
+        char buf[1 << 16];
+        size_t n;
+        while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) b.append(buf, n);
+        std::fclose(f);
+    }
+    if (b.size() < 16 || std::memcmp(b.data(), kMapMagic, 8) != 0) { error = "chunk map: not a map file " + path; return false; }
+    uint64_t sum = 0;
+    std::memcpy(&sum, b.data() + b.size() - 8, 8);
+    if (sum != session_hash64(b.data(), b.size() - 8, kChunkSeed)) { error = "chunk map: checksum mismatch " + path; return false; }
+    const std::string body = b.substr(0, b.size() - 8);
+    MapIn in{body, 8};
+    m.chunk = in.u64();
+    m.depth = (int) in.u64();
+    m.cvec = in.u64() == 1;
+    m.n_kv = in.u64();
+    uint64_t n = 0;
+    if (!in.count(n, 1)) { error = "chunk map: truncated " + path; return false; }
+    m.parent.resize((size_t) n); in.raw(m.parent.data(), n);
+    if (!in.count(n, 4)) { error = "chunk map: truncated " + path; return false; }
+    m.live_ids.resize((size_t) n); in.raw(m.live_ids.data(), n * 4);
+    if (!in.count(n, 16)) { error = "chunk map: truncated " + path; return false; }
+    m.live_imgs.resize((size_t) n);
+    for (auto& k : m.live_imgs) { k.start = (int64_t) in.u64(); k.hash = in.u64(); }
+    if (!in.count(n, 8)) { error = "chunk map: truncated " + path; return false; }
+    m.ck_lens.resize((size_t) n); in.raw(m.ck_lens.data(), n * 8);
+    if (!in.count(n, 16)) { error = "chunk map: truncated " + path; return false; }
+    m.sizes.resize((size_t) n); m.hashes.resize((size_t) n);
+    for (size_t i = 0; i < n && in.ok; ++i) {
+        m.sizes[i] = in.u64();
+        uint64_t h = 0;
+        if (!in.count(h, 8)) break;
+        m.hashes[i].resize((size_t) h);
+        in.raw(m.hashes[i].data(), h * 8);
+    }
+    if (!in.ok || in.at != body.size() || m.chunk == 0) { error = "chunk map: malformed " + path; return false; }
+    const size_t want = (size_t) kStateArrays * (1 + m.ck_lens.size()) + (size_t) kKvParts * m.n_kv;
+    if (m.sizes.size() != want) { error = "chunk map: section count mismatch " + path; return false; }
+    for (size_t i = 0; i < m.sizes.size(); ++i)
+        if (m.hashes[i].size() != (m.sizes[i] + m.chunk - 1) / m.chunk) { error = "chunk map: chunk count mismatch " + path; return false; }
+    return true;
+}
 namespace {
 bool write_impl(const std::string& path, const SavedConversation& image, const std::vector<SessionKvSource>* sources,
                 const SessionFileIdentity& id, size_t& bytes, std::string& error, const SessionWriteOptions& opt,
@@ -1126,6 +1467,66 @@ bool write_guarded(const std::string& path, const SavedConversation& image, cons
 }
 } // namespace
 
+
+bool session_file_write_delta(const std::string& path, const SavedConversation& image, const SessionFileIdentity& id,
+                              const std::string& parent_leaf, const SessionChunkMap& par, const SessionChunkMap& mine,
+                              size_t& bytes, std::string& error, const SessionWriteOptions& opt) {
+    try {
+        if (has_stage_parts(image) || !image.stage_images.empty()) { error = "session file: layer-split state is not journaled as a delta"; return false; }
+        if (mine.chunk == 0 || mine.chunk != par.chunk) { error = "session file: delta and parent maps differ in chunk size"; return false; }
+        Out sizing;
+        put_payload_delta(sizing, image, parent_leaf, par, mine);
+        if (sizing.overflow) { error = "session file: the delta is too large for this build"; return false; }
+        const uint64_t payload = sizing.n, total = kHeader + payload + kTrailer;
+        if (opt.min_free_bytes) {
+            uint64_t avail = 0;
+            if (!free_space(path, avail)) { error = "session file: cannot read the free disk space for " + path; return false; }
+            if (avail < total || avail - total < opt.min_free_bytes) { error = "session file: not enough disk space for the delta"; return false; }
+        }
+        Publisher pub;
+        if (!pub.open(path, error)) return false;
+        RawFile raw;
+        if (!pub.create_temp(raw, error)) { error = "session file: cannot create a temporary file beside " + path + ": " + error; return false; }
+        FileSink f(raw);
+        if (!f.ok()) { error = "session file: " + f.error(); return false; }
+        f.expected = total;
+        uint8_t h[kHeader];
+        header_bytes(h, id, payload);
+        std::memcpy(h, kMagicDelta, 8);                    // the delta magic; the header checksum covers it
+        const uint64_t hh = session_hash64(h, 56, 0);
+        std::memcpy(h + 56, &hh, 8);
+        bool ok = f.write(h, kHeader);
+        SessionHasher hash(0);
+        Out out;
+        out.f = &f;
+        out.hash = &hash;
+        if (ok) put_payload_delta(out, image, parent_leaf, par, mine);
+        ok = ok && out.ok && out.n == payload;
+        if (ok) {
+            const uint64_t ph = hash.digest();
+            ok = f.write(&ph, 8) && f.write(kEnd, 8);
+        }
+        ok = f.finish(opt.durable) && ok;
+        SessionStatus st;
+        std::string why;
+        if (ok && pub.publish(why, opt.durable, st, nullptr)) { bytes = (size_t) total; return true; }
+        error = "session file: writing the delta " + path + " failed" + (why.empty() ? std::string(": " + f.error()) : ": " + why);
+        return false;
+    } catch (const std::bad_alloc&) {
+        error = "session file: out of memory while writing the delta " + path;
+        return false;
+    }
+}
+
+bool session_file_is_delta(const std::string& path) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) return false;
+    char m[8] = {};
+    const bool got = std::fread(m, 1, 8, f) == 8;
+    std::fclose(f);
+    return got && std::memcmp(m, kMagicDelta, 8) == 0;
+}
+
 std::vector<ConversationCheckpoint> session_checkpoints_to_save(const std::vector<ConversationCheckpoint>& chain) {
     const ConversationCheckpoint* deepest = session_deepest_checkpoint(chain);
     if (!deepest) return {};
@@ -1211,7 +1612,8 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     std::memcpy(&version, h + 8, 4); std::memcpy(&hsize, h + 12, 4);
     std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8); std::memcpy(&payload, h + 32, 8);
     std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
-    if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return false; }
+    const bool delta = std::memcmp(h, kMagicDelta, 8) == 0;   // a journal delta (conversation_file.hpp)
+    if (!delta && std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return false; }
     if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return false; }
     if (version != kVersion) { error = "session file: unsupported version " + std::to_string(version); return false; }
     if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return false; }
@@ -1232,7 +1634,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     }
     SavedConversation parsed;
     In in{&f, SessionHasher(0), payload, error, limits};
-    if (!get_payload(in, parsed)) { st.error = in.kind; return false; }
+    if (!(delta ? read_delta_payload(in, path, id, parsed, limits) : get_payload(in, parsed))) { st.error = in.kind; return false; }
     if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
     uint8_t t[kTrailer];
     if (!f.read(t, kTrailer)) { st.error = f.kind(); error = "session file: trailer read error: " + f.error(); return false; }
@@ -1240,6 +1642,11 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     std::memcpy(&ph, t, 8);
     if (ph != in.hash.digest()) { error = "session file: payload checksum mismatch"; return false; }
     if (std::memcmp(t + 8, kEnd, 8) != 0) { error = "session file: bad end marker"; return false; }
+    if (delta) {   // the rebuilt image, chunk by chunk, against what was parked
+        SessionChunkMap want;
+        if (!session_chunk_map_read(path + ".map", want, error)) { error = "session file: delta without its map: " + error; return false; }
+        if (!verify_against_map(parsed, want, error)) return false;
+    }
     image = std::move(parsed);
     bytes = (size_t) size;
     st.error = SessionError::none;
