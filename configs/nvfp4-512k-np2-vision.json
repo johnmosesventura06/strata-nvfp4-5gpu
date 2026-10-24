@@ -90,7 +90,6 @@
   "STRATA_QSA_ROWS": "1",
   "STRATA_GU_SWIGLU": "1",
   "STRATA_ATTN_DAILY": "1",
-  "STRATA_HC_UPMIX": "1",
   "STRATA_SIDE_MIXER": "2"
  },
  "host": "0.0.0.0",
