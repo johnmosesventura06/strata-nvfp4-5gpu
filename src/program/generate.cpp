@@ -91,6 +91,7 @@
 #include <array>
 #include <chrono>
 #include <algorithm>
+#include <iterator>
 #include <memory>
 #include <iostream>
 #include <functional>
@@ -470,6 +471,13 @@ struct Options {
     int peer_device = -1;          ///< the first peer device (legacy accessor; -1 = off)
     int peer_reserve_mib = 600;
     int64_t peer_slots = 0;
+    /// --peer-slots A,B,C: a cap per tier in --peer-devices order (a single value caps every tier; 0 = what fits)
+    std::vector<int64_t> peer_slots_list;
+    /// --peer-fill greedy|round-robin: greedy (default) fills each tier with the hottest pairs left, so the first
+    /// tier holds the hottest experts and the last one the leftovers; round-robin deals the ranked pairs out in turn
+    /// (rank 0 -> tier 0, rank 1 -> tier 1, ...) so every tier gets an even share of the hot ones, and what a tier
+    /// cannot hold spills to the next.
+    std::string peer_fill = "greedy";
     int peer_adapt_swaps = -1;
     /// the prompt path's rows per layer the peer computes: -1 = half of chunk x top-k, 0 = the prompt path stays on
     /// the primary
@@ -870,7 +878,10 @@ void usage() {
                   "                       full-head greedy pick.  Needs --native-head-gguf, --peer-devices and\n"
                   "                       --spec >= 2; 0 (the default) leaves every window on the main GPU.\n"
                  "  --peer-reserve-mib N  VRAM the peer tier leaves free on its card (default 600)\n"
-                 "  --peer-slots N       expert slots on the peer (default: what fits)\n"
+                 "  --peer-slots N[,N..] expert slots per tier, in --peer-devices order; one value caps every tier\n"
+                 "                       (default: what fits)\n"
+                 "  --peer-fill greedy|round-robin  greedy (default): each tier takes the hottest pairs left;\n"
+                 "                       round-robin: deal the ranked pairs out in turn so the tiers share the hot ones\n"
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
                  "  --peer-prefill-rows N  prompt rows per layer the tiers compute (default half of chunk x top-k,\n"
                  "                       split across them; 0 = the prompt path stays on the primary)\n"
@@ -2046,7 +2057,20 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--peer-reserve-mib") o.peer_reserve_mib = std::atoi(next("--peer-reserve-mib"));
-        else if (a == "--peer-slots") o.peer_slots = std::atoll(next("--peer-slots"));
+        else if (a == "--peer-slots") {
+            const std::string v = next("--peer-slots");
+            o.peer_slots_list.clear();
+            size_t p0 = 0;
+            while (p0 <= v.size()) {
+                const size_t c = v.find(',', p0);
+                const std::string t = v.substr(p0, c == std::string::npos ? std::string::npos : c - p0);
+                if (!t.empty()) o.peer_slots_list.push_back(std::atoll(t.c_str()));
+                if (c == std::string::npos) break;
+                p0 = c + 1;
+            }
+            o.peer_slots = o.peer_slots_list.empty() ? 0 : o.peer_slots_list.front();
+        }
+        else if (a == "--peer-fill") o.peer_fill = next("--peer-fill");
         else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(next("--peer-adapt-swaps"));
         else if (a == "--peer-prefill-rows") o.peer_prefill_rows = std::atoll(next("--peer-prefill-rows"));
         else if (a == "--head-split") o.head_split = std::atof(next("--head-split"));
@@ -2547,6 +2571,15 @@ int main(int argc, char** argv) {
         (o.expert_cache_remote[2] > 0 && o.expert_cache_remote[1] == 0)) {
         std::fprintf(stderr, "strata generate: invalid sampling or resource parameter\n");
         return 2;
+    }
+    if (o.peer_fill != "greedy" && o.peer_fill != "round-robin") {
+        std::fprintf(stderr, "strata generate: --peer-fill must be greedy or round-robin\n");
+        return 1;
+    }
+    if (o.peer_slots_list.size() > 1 && o.peer_slots_list.size() != o.peer_devices.size()) {
+        std::fprintf(stderr, "strata generate: --peer-slots has %zu values for %zu --peer-devices\n",
+                     o.peer_slots_list.size(), o.peer_devices.size());
+        return 1;
     }
     if (o.expert_cache_remote_placement != "stripe" && o.expert_cache_remote_placement != "layer") {
         std::fprintf(stderr, "strata generate: --expert-cache-remote-placement must be stripe or layer\n");
@@ -5296,6 +5329,16 @@ int main(int argc, char** argv) {
     // what this tier took, so the tiers are disjoint by construction (their adapts keep it so, below).
     strata::core::PeerExperts peers[strata::core::kMaxPeerTiers];
     int n_peers = 0;
+    // --peer-fill round-robin: a pair's position in the expert profile (hottest = 0), for the spill merge
+    std::vector<int32_t> pair_rank;
+    auto rank_of_pair = [&](const std::pair<int32_t, int32_t>& pr) -> int32_t {
+        return pair_rank[(size_t) pr.first * (size_t) g.n_expert + (size_t) pr.second];
+    };
+    if (o.peer_fill == "round-robin" && !profile.empty()) {
+        pair_rank.assign((size_t) g.n_layers * (size_t) g.n_expert, INT32_MAX);
+        for (size_t i = 0; i < profile.size(); ++i)
+            pair_rank[(size_t) profile[i].first * (size_t) g.n_expert + (size_t) profile[i].second] = (int32_t) i;
+    }
     auto any_peer_has = [&](int64_t l, int32_t e) -> bool {
         for (int p = 0; p < n_peers; ++p) if (peers[p].has(l, e)) return true;
         return false;
@@ -5306,17 +5349,45 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::vector<std::pair<int32_t, int32_t>> cand = profile;
+        const size_t n_tiers = o.peer_devices.size();
+        const bool round_robin = o.peer_fill == "round-robin" && n_tiers > 1;
+        // round-robin: deal the pairs the primary does not hold out in rank order, one per tier in turn
+        std::vector<std::vector<std::pair<int32_t, int32_t>>> dealt(round_robin ? n_tiers : 0);
+        if (round_robin) {
+            size_t k = 0;
+            for (const auto& pr : profile) {
+                if (xcache.slot_of(pr.first, pr.second) >= 0) continue;
+                dealt[k % n_tiers].push_back(pr);
+                ++k;
+            }
+        }
+        std::vector<std::pair<int32_t, int32_t>> spill;   // round-robin: what earlier tiers could not hold
         for (size_t pi = 0; pi < o.peer_devices.size(); ++pi) {
             const auto tp0 = Clock::now();
+            const int64_t cap = o.peer_slots_list.size() > 1 ? o.peer_slots_list[pi] : o.peer_slots;
+            if (round_robin) {   // this tier's share, hottest first, then the earlier tiers' spill (rank order)
+                cand = dealt[pi];
+                std::vector<std::pair<int32_t, int32_t>> merged;
+                merged.reserve(cand.size() + spill.size());
+                std::merge(cand.begin(), cand.end(), spill.begin(), spill.end(), std::back_inserter(merged),
+                           [&](const std::pair<int32_t, int32_t>& a, const std::pair<int32_t, int32_t>& b) {
+                               return rank_of_pair(a) < rank_of_pair(b);
+                           });
+                cand.swap(merged);
+            }
             if (!peers[n_peers].open(o.peer_devices[pi], cand, xcache, *srcp, g.n_layers, g.n_expert,
-                                     o.peer_reserve_mib, o.peer_slots, err)) {
+                                     o.peer_reserve_mib, cap, err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
             std::fprintf(stderr, "strata generate: peer GPU %d: %lld experts, %.2f GiB (filled in %.1f s)\n",
                          o.peer_devices[pi], (long long) peers[n_peers].resident(), peers[n_peers].gib(),
                          std::chrono::duration<double>(Clock::now() - tp0).count());
-            if (pi + 1 < o.peer_devices.size()) {   // the next tier takes what this one did not
+            if (round_robin) {   // what this tier did not take spills to the next one
+                spill.clear();
+                for (const auto& pr : cand)
+                    if (!peers[n_peers].has(pr.first, pr.second)) spill.push_back(pr);
+            } else if (pi + 1 < o.peer_devices.size()) {   // the next tier takes what this one did not
                 std::vector<std::pair<int32_t, int32_t>> next;
                 next.reserve(cand.size());
                 for (const auto& pr : cand)
