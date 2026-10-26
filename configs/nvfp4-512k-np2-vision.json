@@ -26,6 +26,8 @@
   "auto",
   "--peer-devices",
   "1,2,3,4",
+  "--peer-fill",
+  "round-robin",
   "--peer-reserve-mib",
   "1024",
   "--max-context",
